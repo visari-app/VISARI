@@ -6,7 +6,12 @@ import {
   getDocs,
   doc,
   getDoc,
-  setDoc
+  setDoc,
+  query,
+  where,
+  orderBy,
+  deleteDoc,
+  updateDoc
 } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
 import {
   getAuth,
@@ -48,17 +53,25 @@ console.log("¡VISARi conectado a Firebase & Auth con éxito!");
 const DEMO_DATA = {
   user: {
     uid: null,
-    name: "Estudiante",
+    ownerUid: null,
+    name: "",
     email: "",
     avatar: "",
-    country: "Argentina",
+    country: "",
     university: "",
     career: "",
     phone: "",
     isAuthenticated: false
   },
   subjects: [],
-  timeline: []
+  timeline: [],
+  studyRequests: [],
+  studyPartners: [],
+  team: {
+    projectName: "",
+    members: [],
+    tasks: []
+  }
 };
 /**
  * Reactive Application Store
@@ -68,6 +81,13 @@ class VisariStore {
     this.storageKey = 'visari_state_v1';
     this.listeners = [];
     this.state = this.loadState();
+    // Inicializar arreglos para solicitudes y compañeros de estudio
+    if (!this.state.studyRequests) {
+      this.state.studyRequests = [];
+    }
+    if (!this.state.studyPartners) {
+      this.state.studyPartners = [];
+    }
 
     // Timer state (in-memory for active sessions)
     this.timer = {
@@ -84,12 +104,6 @@ class VisariStore {
     if (user && user.email) {
       const userKey = `visari_state_${user.email.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
       this.storageKey = userKey;
-
-      // Migración automática: Rescata tus datos anteriores si tu clave personal está vacía
-      if (!localStorage.getItem(userKey) && localStorage.getItem('visari_state_v1')) {
-        const oldData = localStorage.getItem('visari_state_v1');
-        localStorage.setItem(userKey, oldData);
-      }
 
       const loaded = this.loadState();
 
@@ -239,22 +253,49 @@ class VisariStore {
   }
 
   // --- Subjects Actions ---
-  addSubject(subjectData) {
+  async addSubject(subjectData) {
+    const currentUser = auth.currentUser;
+
+    if (!currentUser) {
+      this.showToast("Iniciá sesión para crear una materia.");
+      return;
+    }
+
     const newSubject = {
+      ownerUid: currentUser.uid,
       id: 'sub-' + Date.now(),
       code: subjectData.code || 'MAT-101',
       name: subjectData.name || 'Nueva Asignatura',
-      color: subjectData.color || 'from-violet-600 to-indigo-800',
-      accent: subjectData.accent || '#8B5CF6',
+      color: subjectData.color || 'from-violet-600 to-indigo-600',
+      accent: subjectData.accent || '#8b5cf6',
       professor: subjectData.professor || 'Profesor Titular',
       credits: Number(subjectData.credits) || 4,
       targetGrade: Number(subjectData.targetGrade) || 8.0,
       studyMinutes: 0,
-      tasks: []
+      tasks: [],
+      createdAt: new Date().toISOString()
     };
-    this.state.subjects.push(newSubject);
-    this.saveState();
-    this.showToast(`Materia "${newSubject.name}" agregada con éxito`);
+
+    try {
+      // Guardar la materia en Firebase usando su mismo ID.
+      await setDoc(
+        doc(db, "subjects", newSubject.id),
+        newSubject
+      );
+
+      // Incorporar la materia al estado local.
+      this.state.subjects.push(newSubject);
+      this.saveState();
+
+      this.showToast(`Materia "${newSubject.name}" agregada con éxito`);
+
+      return true;
+
+    } catch (error) {
+      console.error("Error guardando la materia en Firebase:", error);
+      this.showToast("No se pudo guardar la materia. Revisá la conexión.");
+      return false;
+    }
   }
 
   deleteSubject(subjectId) {
@@ -289,19 +330,21 @@ class VisariStore {
 
     const newTask = {
       id: 't-' + Date.now(),
+      subjectId: subjectId,
       title: taskData.title || 'Nueva actividad',
       type: taskData.type || 'tarea',
       dueDate: taskData.dueDate || new Date().toISOString().split('T')[0],
+      createdAt: new Date().toISOString(),
       weight: Number(taskData.weight) || 10,
       completed: false,
       grade: null
     };
 
     subject.tasks.push(newTask);
+
     this.saveState();
     this.showToast("Actividad agregada a " + subject.name);
   }
-
   deleteTask(subjectId, taskId) {
     const subject = this.state.subjects.find(s => s.id === subjectId);
     if (!subject) return;
@@ -313,35 +356,186 @@ class VisariStore {
   addStudyTime(subjectId, minutes) {
     const subject = this.state.subjects.find(s => s.id === subjectId);
     if (!subject) return;
+
+    // Mantener el acumulado histórico de la materia
     subject.studyMinutes = (subject.studyMinutes || 0) + minutes;
+
+    // Crear historial de sesiones si todavía no existe
+    if (!this.state.studySessions) {
+      this.state.studySessions = [];
+    }
+
+    // Registrar la sesión individual
+    this.state.studySessions.push({
+      id: Date.now().toString(),
+      subjectId: subjectId,
+      subject: subject.name,
+      durationMinutes: minutes,
+      date: new Date().toISOString()
+    });
+
     this.saveState();
+
     this.showToast(`⏱️ Se registraron +${minutes} minutos de estudio en ${subject.name}`);
   }
-
   // --- Team Actions ---
-  addTeamTask(taskData) {
-    const newTask = {
-      id: 'tt-' + Date.now(),
-      title: taskData.title,
-      assigneeId: taskData.assigneeId,
-      status: taskData.status || 'todo',
-      priority: taskData.priority || 'media',
-      dueDate: taskData.dueDate || new Date().toISOString().split('T')[0]
-    };
-    this.state.team.tasks.push(newTask);
-    this.saveState();
-    this.showToast("Tarea asignada al equipo");
+
+  async addTeamTask(taskData) {
+    const currentUser = auth.currentUser;
+
+    try {
+      console.log("📋 Iniciando creación de tarea grupal", {
+        tieneUsuario: !!currentUser,
+        subjectId: taskData?.subjectId,
+        title: taskData?.title
+      });
+
+      if (!currentUser) {
+        throw new Error("No hay un usuario autenticado.");
+      }
+
+      if (!taskData || !taskData.subjectId) {
+        throw new Error("La tarea no tiene una materia seleccionada.");
+      }
+
+      if (!taskData.title?.trim()) {
+        throw new Error("El título de la tarea está vacío.");
+      }
+
+      // Identificar al propietario original de la materia.
+      let ownerUid = currentUser.uid;
+
+      const membershipQuery = query(
+        collection(db, "subject_members"),
+        where("subjectId", "==", String(taskData.subjectId)),
+        where("memberUid", "==", currentUser.uid)
+      );
+
+      const membershipSnapshot = await getDocs(membershipQuery);
+
+      if (!membershipSnapshot.empty) {
+        ownerUid = membershipSnapshot.docs[0].data().ownerUid;
+      }
+
+      const newTask = {
+        title: taskData.title.trim(),
+        assigneeId: taskData.assigneeId || "",
+        status: "todo",
+        priority: taskData.priority || "media",
+        dueDate: taskData.dueDate || "",
+        ownerUid: ownerUid,
+        createdByUid: currentUser.uid,
+        subjectId: String(taskData.subjectId),
+        createdAt: new Date().toISOString()
+      };
+
+      console.log("📤 Datos que se enviarán a Firestore:", newTask);
+
+      const taskRef = await addDoc(
+        collection(db, "team_tasks"),
+        newTask
+      );
+
+      console.log("✅ Tarea guardada en Firestore", {
+        documentId: taskRef.id,
+        subjectId: newTask.subjectId,
+        status: newTask.status
+      });
+
+      this.showToast("Tarea guardada correctamente.");
+
+      // El formulario recargará las tareas desde Firestore.
+      // No agregamos otra copia al estado local aquí.
+      return true;
+
+    } catch (error) {
+      console.error("❌ ERROR AL GUARDAR TAREA GRUPAL");
+      console.error("Código:", error?.code || "Sin código");
+      console.error("Mensaje:", error?.message || error);
+      console.error("Nombre:", error?.name);
+      console.error("Error completo:", error);
+      if (error?.stack) {
+        console.error("Traza:", error.stack);
+      }
+
+      const code = error?.code || "";
+      let message = "No se pudo guardar la tarea. Revisá la consola.";
+
+      if (code === "permission-denied") {
+        message = "Firebase rechazó el permiso para guardar la tarea.";
+      } else if (code === "unauthenticated") {
+        message = "Tu sesión no está autenticada. Volvé a iniciar sesión.";
+      } else if (code === "unavailable") {
+        message = "Firebase no está disponible. Revisá tu conexión.";
+      } else if (code === "failed-precondition") {
+        message = "Firebase informó una condición previa que impide guardar.";
+      }
+
+      this.showToast(message);
+      return false;
+    }
   }
 
-  updateTeamTaskStatus(taskId, newStatus) {
-    const task = this.state.team.tasks.find(t => t.id === taskId);
-    if (task) {
-      task.status = newStatus;
-      this.saveState();
-      if (newStatus === 'done') {
-        this.triggerConfetti();
-        this.showToast(`🎉 Tarea del equipo completada: "${task.title}"`);
+  // --- Procesar formulario de tarea grupal ---
+
+  async handleNewTeamTaskSubmit(event) {
+    event.preventDefault();
+
+    const title =
+      document.getElementById("team-task-title")?.value.trim();
+
+    const subjectId =
+      document.getElementById("team-subject-select")?.value;
+
+    const assigneeId =
+      document.getElementById("team-task-assignee")?.value;
+
+    const priority =
+      document.getElementById("team-task-priority")?.value;
+
+    const dueDate =
+      document.getElementById("team-task-date")?.value;
+
+    if (!title || !subjectId) {
+      this.showToast("Completá el título y seleccioná una materia.");
+      return;
+    }
+
+    try {
+      console.log("🧭 Enviando tarea:", {
+        title,
+        subjectId,
+        assigneeId,
+        priority,
+        dueDate
+      });
+
+      const saved = await this.store.addTeamTask({
+        title,
+        subjectId,
+        assigneeId,
+        priority,
+        dueDate,
+        status: "todo"
+      });
+
+      if (saved !== true) {
+        console.warn("La tarea no se guardó; se mantiene abierto el modal.");
+        return;
       }
+
+      await this.loadTeamTasks(subjectId);
+
+      // Renderizar con el estado que realmente utiliza el tablero.
+      this.renderTeam(this.store.state);
+
+      this.closeNewTeamTaskModal();
+
+      console.log("✅ Tablero actualizado correctamente.");
+
+    } catch (error) {
+      console.error("❌ Error al procesar o actualizar el Kanban:", error);
+      this.showToast("La tarea se guardó o procesó, pero no se pudo actualizar el tablero. Revisá la consola.");
     }
   }
 
@@ -409,10 +603,11 @@ class VisariApp {
 
     this.setupGlobalEvents();
     this.setupFirebaseAuth();
+    this.render();
   }
 
   setupGlobalEvents() {
-    // Top Bar Botón B quick-trigger
+    // Top Bar Botón V quick-trigger
     const topBarBtnB = document.getElementById('topbar-btn-b');
     if (topBarBtnB) {
       topBarBtnB.addEventListener('click', () => {
@@ -443,54 +638,158 @@ class VisariApp {
       }
     });
   }
+  async syncMySubjectsToFirebase(uid) {
+    if (!uid) return;
 
-  async handleUserAuthenticated(firebaseUser) {
-    this.store.setUserData(firebaseUser);
-    let profileData = null;
+    const subjects = Array.isArray(this.store?.state?.subjects)
+      ? this.store.state.subjects
+      : [];
 
-    // Load or initialize user profile in Firestore
     try {
-      const userDocRef = doc(db, "users", firebaseUser.uid);
+      for (const subject of subjects) {
+        if (!subject || !subject.id) continue;
+
+        // No migrar materias que pertenecen a otro usuario.
+        if (subject.ownerUid && subject.ownerUid !== uid) continue;
+
+        const subjectRef = doc(db, "subjects", String(subject.id));
+        const subjectSnap = await getDoc(subjectRef);
+
+        // Crear el documento solamente si todavía no existe.
+        if (!subjectSnap.exists()) {
+          await setDoc(subjectRef, {
+            ...subject,
+            id: String(subject.id),
+            ownerUid: uid,
+            createdAt: subject.createdAt || new Date().toISOString()
+          });
+        }
+      }
+
+      console.log("Materias propias sincronizadas con Firebase.");
+
+    } catch (error) {
+      console.error("Error sincronizando materias:", error);
+    }
+  }
+  async loadSharedSubjectsFromFirebase(uid) {
+    if (!uid) return;
+
+    try {
+      const membershipQuery = query(
+        collection(db, "subject_members"),
+        where("memberUid", "==", uid)
+      );
+
+      const membershipSnapshot = await getDocs(membershipQuery);
+
+      const localSubjects = this.store.state.subjects || [];
+
+      for (const membershipDoc of membershipSnapshot.docs) {
+        const membership = membershipDoc.data();
+
+        const subjectRef = doc(
+          db,
+          "subjects",
+          String(membership.subjectId)
+        );
+
+        const subjectSnap = await getDoc(subjectRef);
+
+        if (!subjectSnap.exists()) {
+          console.warn(
+            "No se encontró la materia compartida:",
+            membership.subjectId
+          );
+          continue;
+        }
+
+        const sharedSubject = {
+          ...subjectSnap.data(),
+          id: String(membership.subjectId),
+          isShared: true,
+          sharedOwnerUid: membership.ownerUid
+        };
+
+        const alreadyExists = localSubjects.some(
+          subject => String(subject.id) === String(sharedSubject.id)
+        );
+
+        if (!alreadyExists) {
+          localSubjects.push(sharedSubject);
+        }
+      }
+
+      this.store.state.subjects = localSubjects;
+      this.store.saveState();
+
+      console.log("Materias compartidas cargadas:", localSubjects);
+
+    } catch (error) {
+      console.error("Error cargando materias compartidas:", error);
+    }
+  }
+  async handleUserAuthenticated(firebaseUser) {
+    // Cargar el estado local correspondiente a este usuario.
+    this.store.setUserData(firebaseUser);
+    await this.syncMySubjectsToFirebase(firebaseUser.uid);
+    await this.loadSharedSubjectsFromFirebase(firebaseUser.uid);
+    const userDocRef = doc(db, "users", firebaseUser.uid);
+
+    // Perfil vacío para una cuenta que todavía no guardó sus datos.
+    let profileData = {
+      uid: firebaseUser.uid,
+      ownerUid: firebaseUser.uid,
+      name: "",
+      email: firebaseUser.email || "",
+      avatar: "",
+      country: "",
+      university: "",
+      career: "",
+      phone: ""
+    };
+
+    try {
       const userSnap = await getDoc(userDocRef);
 
       if (userSnap.exists()) {
-        profileData = userSnap.data();
-      } else {
+        const savedProfile = userSnap.data();
+
+        // Evitar cargar un perfil que no corresponda al usuario.
+        if (
+          savedProfile.ownerUid &&
+          savedProfile.ownerUid !== firebaseUser.uid
+        ) {
+          throw new Error("El perfil no pertenece al usuario autenticado.");
+        }
+
         profileData = {
+          ...profileData,
+          ...savedProfile,
           uid: firebaseUser.uid,
-          name: firebaseUser.displayName || (firebaseUser.email ? firebaseUser.email.split('@')[0] : "Estudiante"),
-          email: firebaseUser.email || "",
-          avatar: firebaseUser.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(firebaseUser.displayName || firebaseUser.email || 'Estudiante')}&background=7c3aed&color=fff`,
-          country: this.store.state.user.country || "Argentina",
-          university: this.store.state.user.university || "",
-          career: this.store.state.user.career || "",
-          phone: this.store.state.user.phone || "",
-          createdAt: new Date().toISOString()
+          ownerUid: firebaseUser.uid,
+          email: firebaseUser.email || savedProfile.email || ""
         };
-        await setDoc(userDocRef, profileData, { merge: true });
       }
     } catch (err) {
-      console.warn("Firestore access info (falling back to Auth profile):", err);
+      console.error("Error al cargar el perfil desde Firestore:", err);
     }
 
-    const realName = (profileData && profileData.name) || firebaseUser.displayName || (firebaseUser.email ? firebaseUser.email.split('@')[0] : "Estudiante");
-    const realEmail = firebaseUser.email || (profileData && profileData.email) || "";
-    const realAvatar = (profileData && profileData.avatar) || firebaseUser.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(realName)}&background=7c3aed&color=fff`;
-
+    // No completar nombre, universidad, carrera ni avatar automáticamente.
     this.store.state.user = {
       ...this.store.state.user,
-      ...(profileData || {}),
+      ...profileData,
       uid: firebaseUser.uid,
-      name: realName,
-      email: realEmail,
-      avatar: realAvatar,
+      ownerUid: firebaseUser.uid,
       isAuthenticated: true
     };
+
     this.store.saveState();
 
-    if (this.currentView === 'landing') {
-      this.currentView = 'dashboard';
+    if (this.currentView === "landing") {
+      this.currentView = "dashboard";
     }
+
     this.render();
   }
 
@@ -705,6 +1004,7 @@ class VisariApp {
     if (view === 'materia-detail' && payload) {
       this.selectedSubjectDetail = payload;
     }
+
     this.render();
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
@@ -765,6 +1065,8 @@ class VisariApp {
       case 'profile':
         this.renderProfile(state);
         break;
+      default:
+        this.renderDashboard(state);
     }
 
     // Reinitialize icons if lucide is loaded
@@ -887,6 +1189,7 @@ class VisariApp {
   // ==========================================
   renderProfile(state) {
     const user = state.user;
+
     const nameInput = document.getElementById('profile-name');
     const avatarInput = document.getElementById('profile-avatar');
     const countryInput = document.getElementById('profile-country');
@@ -901,38 +1204,11 @@ class VisariApp {
     if (uniInput) uniInput.value = user.university || '';
     if (careerInput) careerInput.value = user.career || '';
     if (phoneInput) phoneInput.value = user.phone || '';
-    if (emailDisplay) emailDisplay.textContent = user.email || 'Sin correo';
-
-    // 1. Actualizar la previsualización visual del avatar en el perfil
-    const avatarContainer = document.getElementById('profile-avatar-preview');
-    if (avatarContainer) {
-      if (user.avatar) {
-        avatarContainer.innerHTML = `<img src="${user.avatar}" class="w-full h-full rounded-full object-cover" />`;
-      } else {
-        const initial = (user.name || 'V')[0].toUpperCase();
-        avatarContainer.innerHTML = `<span class="text-xl font-bold text-white">${initial}</span>`;
-      }
+    if (emailDisplay) {
+      emailDisplay.textContent = user.email || 'Sin correo asociado';
     }
 
-    // 2. Guardado automático al escribir o cambiar la URL de la foto
-    if (avatarInput && !avatarInput.dataset.listener) {
-      avatarInput.dataset.listener = "true";
-      avatarInput.addEventListener('input', (e) => {
-        this.store.state.user.avatar = e.target.value.trim();
-        this.store.saveState();
-        this.renderProfile(this.store.state);
-      });
-    }
-
-    // 3. Guardado automático al cambiar el nombre
-    if (nameInput && !nameInput.dataset.listener) {
-      nameInput.dataset.listener = "true";
-      nameInput.addEventListener('input', (e) => {
-        this.store.state.user.name = e.target.value.trim();
-        this.store.saveState();
-      });
-    }
-    // Summary counters in profile
+    // Contadores del perfil
     const metrics = this.store.getGlobalMetrics();
     const countSubjects = document.getElementById('profile-stat-subjects');
     const countHours = document.getElementById('profile-stat-hours');
@@ -942,144 +1218,226 @@ class VisariApp {
     if (countHours) countHours.textContent = metrics.formattedHours;
     if (countGpa) countGpa.textContent = metrics.gpa;
 
-    // Helper: Dynamic real-time avatar sync across the entire app (Preview, Header Top-Right, Sidebar)
+    // Actualizar los avatares en toda la aplicación
     const syncAvatars = (imageUrl) => {
       const fallback = `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || 'Estudiante')}&background=7c3aed&color=fff`;
-      const targetUrl = imageUrl && imageUrl.trim() ? imageUrl.trim() : fallback;
+      const targetUrl = imageUrl && imageUrl.trim()
+        ? imageUrl.trim()
+        : fallback;
 
-      // Update preview in profile
       const previewImg = document.getElementById('profile-avatar-preview');
       if (previewImg) previewImg.src = targetUrl;
 
-      // Update all avatar instances throughout the application
       const allAvatars = document.querySelectorAll('.user-display-avatar');
-      allAvatars.forEach(img => {
+
+      allAvatars.forEach((img) => {
         if (img.tagName === 'IMG') {
           img.src = targetUrl;
         }
       });
     };
 
-    // Live update when typing or pasting URL
+    // Actualización del avatar al escribir o pegar una URL
     if (avatarInput) {
       avatarInput.oninput = (e) => {
         const val = e.target.value.trim();
+
         syncAvatars(val);
-        document.querySelectorAll('.avatar-preset-btn').forEach(btn => {
+
+        document.querySelectorAll('.avatar-preset-btn').forEach((btn) => {
           if (btn.getAttribute('data-url') === val) {
-            btn.classList.add('border-violet-600', 'ring-2', 'ring-violet-400');
+            btn.classList.add(
+              'border-violet-600',
+              'ring-2',
+              'ring-violet-400'
+            );
             btn.classList.remove('border-transparent');
           } else {
-            btn.classList.remove('border-violet-600', 'ring-2', 'ring-violet-400');
+            btn.classList.remove(
+              'border-violet-600',
+              'ring-2',
+              'ring-violet-400'
+            );
             btn.classList.add('border-transparent');
           }
         });
       };
     }
 
-    // Direct PC File Upload using FileReader (Base64)
+    // Subir una imagen desde la computadora
     const fileInput = document.getElementById('profile-avatar-file');
+
     if (fileInput) {
       fileInput.onchange = (e) => {
         const file = e.target.files && e.target.files[0];
+
         if (!file) return;
 
         if (file.size > 3 * 1024 * 1024) {
-          this.store.showToast("⚠️ La imagen seleccionada es mayor a 3MB. Se recomienda una imagen más ligera.");
+          this.store.showToast(
+            '⚠️ La imagen seleccionada es mayor a 3MB. Se recomienda una imagen más ligera.'
+          );
         }
 
         const reader = new FileReader();
+
         reader.onload = (loadEvent) => {
           const base64Data = loadEvent.target.result;
-          if (avatarInput) avatarInput.value = base64Data;
+
+          if (avatarInput) {
+            avatarInput.value = base64Data;
+          }
+
           syncAvatars(base64Data);
 
           const statusEl = document.getElementById('file-upload-status');
+
           if (statusEl) {
             statusEl.textContent = `✓ ${file.name.slice(0, 16)}...`;
             statusEl.classList.remove('text-slate-400');
             statusEl.classList.add('text-emerald-600', 'font-semibold');
           }
 
-          document.querySelectorAll('.avatar-preset-btn').forEach(btn => {
-            btn.classList.remove('border-violet-600', 'ring-2', 'ring-violet-400');
+          document.querySelectorAll('.avatar-preset-btn').forEach((btn) => {
+            btn.classList.remove(
+              'border-violet-600',
+              'ring-2',
+              'ring-violet-400'
+            );
             btn.classList.add('border-transparent');
           });
 
-          this.store.showToast("📷 Imagen procesada correctamente. Haz clic en 'Guardar Cambios' para conservarla.");
+          this.store.showToast(
+            "📷 Imagen procesada correctamente. Haz clic en 'Guardar Cambios' para conservarla."
+          );
         };
+
         reader.readAsDataURL(file);
       };
     }
 
-    // Avatar presets quick selection
+    // Selección de avatares predeterminados
     const avatarPresets = document.querySelectorAll('.avatar-preset-btn');
-    avatarPresets.forEach(btn => {
+
+    avatarPresets.forEach((btn) => {
       const url = btn.getAttribute('data-url');
+
       if (user.avatar === url) {
-        btn.classList.add('border-violet-600', 'ring-2', 'ring-violet-400');
+        btn.classList.add(
+          'border-violet-600',
+          'ring-2',
+          'ring-violet-400'
+        );
         btn.classList.remove('border-transparent');
       } else {
-        btn.classList.remove('border-violet-600', 'ring-2', 'ring-violet-400');
+        btn.classList.remove(
+          'border-violet-600',
+          'ring-2',
+          'ring-violet-400'
+        );
         btn.classList.add('border-transparent');
       }
 
       btn.onclick = () => {
-        if (avatarInput) avatarInput.value = url;
+        if (avatarInput) {
+          avatarInput.value = url;
+        }
+
         syncAvatars(url);
 
-        avatarPresets.forEach(b => {
-          b.classList.remove('border-violet-600', 'ring-2', 'ring-violet-400');
-          b.classList.add('border-transparent');
+        avatarPresets.forEach((preset) => {
+          preset.classList.remove(
+            'border-violet-600',
+            'ring-2',
+            'ring-violet-400'
+          );
+          preset.classList.add('border-transparent');
         });
-        btn.classList.add('border-violet-600', 'ring-2', 'ring-violet-400');
+
+        btn.classList.add(
+          'border-violet-600',
+          'ring-2',
+          'ring-violet-400'
+        );
         btn.classList.remove('border-transparent');
 
         const statusEl = document.getElementById('file-upload-status');
+
         if (statusEl) {
-          statusEl.textContent = "Preset seleccionado";
+          statusEl.textContent = 'Preset seleccionado';
           statusEl.classList.remove('text-emerald-600', 'font-semibold');
           statusEl.classList.add('text-slate-400');
         }
       };
     });
 
-    // Form submit
+    // Guardar el formulario del perfil
     const profileForm = document.getElementById('profile-form');
+
     if (profileForm) {
       profileForm.onsubmit = async (e) => {
         e.preventDefault();
-        const newAvatar = avatarInput.value.trim() || user.avatar;
+
+        const currentUser = auth.currentUser;
+
+        if (!currentUser) {
+          this.store.showToast(
+            'Debés iniciar sesión para guardar tu perfil.'
+          );
+          return;
+        }
+
         const updatedData = {
-          name: nameInput.value.trim(),
-          avatar: newAvatar,
-          country: countryInput.value.trim(),
-          university: uniInput.value.trim(),
-          career: careerInput.value.trim(),
-          phone: phoneInput.value.trim()
+          ownerUid: currentUser.uid,
+          uid: currentUser.uid,
+          email: currentUser.email || '',
+          name: nameInput ? nameInput.value.trim() : '',
+          avatar: avatarInput ? avatarInput.value.trim() : '',
+          country: countryInput ? countryInput.value.trim() : '',
+          university: uniInput ? uniInput.value.trim() : '',
+          career: careerInput ? careerInput.value.trim() : '',
+          phone: phoneInput ? phoneInput.value.trim() : ''
         };
+
+        // Primero, guardar los datos en Firestore
+        try {
+          await setDoc(
+            doc(db, 'users', currentUser.uid),
+            updatedData,
+            { merge: true }
+          );
+        } catch (err) {
+          console.error('Error al guardar el perfil en Firestore:', err);
+
+          this.store.showToast(
+            'No se pudo guardar el perfil. Intentá nuevamente.'
+          );
+          return;
+        }
+
+        // Actualizar el estado local después de guardar correctamente
         this.store.updateUser(updatedData);
 
-        // Sync with Firestore if active Firebase session
-        if (auth.currentUser) {
-          try {
-            await setDoc(doc(db, "users", auth.currentUser.uid), updatedData, { merge: true });
-          } catch (err) {
-            console.warn("Firestore error updating profile:", err);
-          }
-
-          try {
-            await updateProfile(auth.currentUser, {
-              displayName: updatedData.name,
-              photoURL: updatedData.avatar.startsWith('http') ? updatedData.avatar : null
-            });
-          } catch (err) {
-            console.warn("Firebase Auth error updating profile:", err);
-          }
+        // Actualizar el perfil de Firebase Authentication
+        try {
+          await updateProfile(currentUser, {
+            displayName: updatedData.name || '',
+            photoURL: updatedData.avatar.startsWith('http')
+              ? updatedData.avatar
+              : null
+          });
+        } catch (err) {
+          console.warn(
+            'No se pudo actualizar el perfil de Firebase Authentication:',
+            err
+          );
         }
+
+        this.store.showToast('Perfil guardado correctamente.');
       };
     }
   }
+
 
   // ==========================================
   // VIEW 3: DASHBOARD GENERAL
@@ -1105,7 +1463,7 @@ class VisariApp {
     }
 
     // =====================================
-    // RESUMEN SEMANAL POR MATERIA (LUNES A DOMINGO)
+    // RESUMEN SEMANAL (LUNES A DOMINGO)
     // =====================================
     const weeklySection = document.getElementById('dashboard-weekly-summary');
     if (weeklySection) {
@@ -1120,103 +1478,288 @@ class VisariApp {
       sunday.setDate(monday.getDate() + 6);
       sunday.setHours(23, 59, 59, 999);
 
-      const weeklySessions = (state.studySessions || []).filter(session => {
+      // 1. SESIONES DE ESTUDIO DE LA SEMANA
+      const studySessions = this.state?.studySessions || state.studySessions || [];
+
+      const weeklySessions = studySessions.filter(session => {
         const sessionDate = new Date(session.date);
         return sessionDate >= monday && sessionDate <= sunday;
       });
 
-      // Generar tarjetas individuales por cada materia
-      const subjectsHtml = (state.subjects || []).map(subject => {
-        const subSessions = weeklySessions.filter(s => s.subject === subject.name || s.subjectId === subject.id);
-        const subMinutes = subSessions.reduce((acc, s) => acc + (s.durationMinutes || 0), 0);
-        const subHours = (subMinutes / 60).toFixed(1);
+      // 2. SUMAR MINUTOS
+      const totalWeeklyMinutes = weeklySessions.reduce((total, session) => {
+        return total + Number(session.durationMinutes || session.minutes || 0);
+      }, 0);
 
-        const subTasks = subject.tasks || [];
-        const pendingTasks = subTasks.filter(t => !t.completed).length;
-        const totalTasks = subTasks.length;
-        const progressPercent = totalTasks > 0 ? Math.round(((totalTasks - pendingTasks) / totalTasks) * 100) : 0;
+      // 3. FORMATO HORAS Y MINUTOS
+      const weeklyHours = Math.floor(totalWeeklyMinutes / 60);
+      const weeklyMinutes = totalWeeklyMinutes % 60;
 
-        return `
-                    <div class="p-4 bg-white/90 backdrop-blur rounded-xl border border-indigo-100 shadow-sm flex flex-col justify-between">
-                        <div>
-                            <div class="flex items-center justify-between mb-2">
-                                <h4 class="text-xs font-bold text-slate-900 truncate" title="${subject.name}">${subject.name}</h4>
-                                <span class="px-2 py-0.5 bg-indigo-50 text-indigo-700 text-[10px] font-semibold rounded-full">${subHours} hrs esta semana</span>
-                            </div>
-                            <div class="w-full bg-slate-100 rounded-full h-1.5 mb-3 overflow-hidden">
-                                <div class="bg-indigo-600 h-1.5 rounded-full transition-all duration-500" style="width: ${progressPercent}%"></div>
-                            </div>
-                        </div>
-                        <div class="flex items-center justify-between text-[11px] text-slate-500 pt-2 border-t border-slate-100">
-                            <span>Tareas pendientes: <strong class="text-slate-700">${pendingTasks}</strong></span>
-                            <span>Avance: <strong class="text-indigo-600">${progressPercent}%</strong></span>
-                        </div>
-                    </div>
-                `;
-      }).join('');
+      const formattedWeeklyTime = `${weeklyHours} h ${weeklyMinutes} min`;
 
+      // 4. MATERIAS ACTIVAS ESTA SEMANA
+      const weeklyHoursBySubject = {};
+
+      // Contar materias donde se registró tiempo de estudio
+      weeklySessions.forEach(session => {
+        const subjectKey = session.subjectId || session.subject;
+
+        if (subjectKey) {
+          weeklyHoursBySubject[subjectKey] = true;
+        }
+      });
+
+      // Contar también materias donde se crearon actividades esta semana
+      (state.subjects || []).forEach(subject => {
+        (subject.tasks || []).forEach(task => {
+          const taskDate = new Date(task.createdAt || task.dueDate);
+
+          if (
+            !isNaN(taskDate.getTime()) &&
+            taskDate >= monday &&
+            taskDate <= sunday
+          ) {
+            weeklyHoursBySubject[subject.id] = true;
+          }
+        });
+      });
+
+      // 5. TAREAS PENDIENTES DE LA SEMANA
+
+      const teamTasks = this.store?.state?.team?.tasks || [];
+
+      const personalTasks = state.tasks || [];
+
+      // Actividades personales guardadas dentro de cada materia
+      const subjectTasks = (state.subjects || []).flatMap(subject =>
+        (subject.tasks || []).map(task => ({
+          ...task,
+          subjectId: task.subjectId || subject.id
+        }))
+      );
+
+      // Unificar actividades personales y tareas de equipo
+      const allTasks = [
+        ...personalTasks,
+        ...teamTasks,
+        ...subjectTasks
+      ];
+
+      // Evitar duplicados por ID
+      const uniqueTasks = [
+        ...new Map(
+          allTasks.map((task, index) => [
+            task.id || `${task.title || 'tarea'}-${index}`,
+            task
+          ])
+        ).values()
+      ];
+
+      const weeklyPendingTasks = uniqueTasks.filter(task => {
+
+        // Priorizar la fecha de creación
+        const rawDate = task.createdAt || task.dueDate || task.date;
+
+        if (!rawDate) return false;
+
+        const taskDate = rawDate.toDate
+          ? rawDate.toDate()
+          : /^\d{4}-\d{2}-\d{2}$/.test(String(rawDate))
+            ? new Date(`${rawDate}T12:00:00`)
+            : new Date(rawDate);
+
+        if (isNaN(taskDate.getTime())) return false;
+
+        const isThisWeek =
+          taskDate >= monday && taskDate <= sunday;
+
+        const isCompleted =
+          task.completed === true ||
+          task.status === 'done' ||
+          task.status === 'completed';
+
+        return isThisWeek && !isCompleted;
+
+      }).length;
       weeklySection.innerHTML = `
-                <div class="p-6 bg-gradient-to-br from-indigo-50/90 via-slate-50 to-violet-50/50 rounded-2xl border border-indigo-100/80 shadow-sm my-6">
-                    <div class="flex items-center justify-between mb-5">
-                        <div>
-                            <h3 class="text-sm font-bold text-indigo-950">Rendimiento Semanal por Materia</h3>
-                            <p class="text-xs text-indigo-700/70">Ciclo activo: Del ${monday.toLocaleDateString()} al ${sunday.toLocaleDateString()}</p>
-                        </div>
-                        <span class="px-3 py-1 bg-indigo-600 text-white text-xs font-semibold rounded-full shadow-sm">Lunes a Domingo</span>
-                    </div>
-                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        ${subjectsHtml || '<p class="text-xs text-slate-500">No hay materias registradas.</p>'}
-                    </div>
-                </div>
-            `;
+                <div class="p-5 bg-gradient-to-br from-indigo-50/90 via-slate-50 to-violet-50/50 rounded-2xl border border-indigo-100/80 shadow-sm mb-6">
+                    <div class="flex items-center justify-between mb-4">
+          <div>
+                            <h3 class="text-sm font-bold text-indigo-950">Rendimiento Semanal (Lunes a Domingo)</h3>
+                            <p class="text-xs text-indigo-700/70">Del ${monday.toLocaleDateString()} al ${sunday.toLocaleDateString()}</p>
+         </div>
+    <span class="px-2.5 py-1 bg-indigo-600 text-white text-xs font-semibold rounded-full shadow-sm">Ciclo Activo</span>
+</div>
+
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+    <!-- HORAS DE ESTUDIO -->
+    <div class="p-3 bg-white/80 backdrop-blur rounded-xl border border-indigo-100/50">
+        <span class="text-[11px] font-medium text-slate-500 block mb-1">
+            Horas de Estudio Semanal
+        </span>
+        <span class="text-lg font-bold text-indigo-900">
+            ${formattedWeeklyTime}
+        </span>
+    </div>
+
+    <!-- MATERIAS ACTIVAS -->
+    <div class="p-3 bg-white/80 backdrop-blur rounded-xl border border-indigo-100/50">
+        <span class="text-[11px] font-medium text-slate-500 block mb-1">
+            Materias Activas esta Semana
+        </span>
+        <span class="text-lg font-bold text-indigo-900">
+            ${Object.keys(weeklyHoursBySubject).length}
+        </span>
+    </div>
+
+    <!-- TAREAS PENDIENTES -->
+    <div class="p-3 bg-white/80 backdrop-blur rounded-xl border border-indigo-100/50">
+        <span class="text-[11px] font-medium text-slate-500 block mb-1">
+            Tareas / Actividades Pendientes
+        </span>
+        <span class="text-lg font-bold text-indigo-900">
+            ${weeklyPendingTasks}
+        </span>
+    </div>
+
+</div>
+</div>
+    `;
     }
 
     // ... acá continúa el resto de tu código de renderDashboard (como el listado de materias de la línea 1112) ...
     // 4 Main Segments Previews
+    // 1. Obtener materias y sesiones de forma segura desde la app o el estado
+    const currentSubjects = (this.state && this.state.subjects) ? this.state.subjects : (state && state.subjects) ? state.subjects : [];
+    const currentSessions = (this.state && this.state.studySessions) ? this.state.studySessions : (state && state.studySessions) ? state.studySessions : [];
 
+    // 2. Calcular promedio base de materias o por tareas completadas
+    let totalScore = 0;
+    let scoredCount = 0;
+    let totalProgressScore = 0;
+
+    if (currentSubjects.length > 0) {
+      currentSubjects.forEach(sub => {
+        const grade = sub.grade !== undefined ? Number(sub.grade) : (sub.nota !== undefined ? Number(sub.nota) : NaN);
+        if (!isNaN(grade)) {
+          totalScore += grade;
+          scoredCount++;
+        }
+        // Contar avance de tareas por materia
+        if (sub.tasks && sub.tasks.length > 0) {
+          const doneTasks = sub.tasks.filter(t => t.completed).length;
+          totalProgressScore += (doneTasks / sub.tasks.length) * 10;
+        }
+      });
+    }
+
+    // Definir nota base (si hay notas usa el promedio, si no, usa el avance de tareas, o un 6.5 inicial)
+    let baseAverage = 6.5;
+    if (scoredCount > 0) {
+      baseAverage = totalScore / scoredCount;
+    } else if (currentSubjects.length > 0) {
+      baseAverage = totalProgressScore / currentSubjects.length;
+      if (baseAverage < 5.0) baseAverage = 6.5;
+    }
+
+    // 3. Calcular horas de estudio totales acumuladas o de la semana
+    let totalMinutes = 0;
+    currentSessions.forEach(ses => {
+      totalMinutes += ses.durationMinutes || ses.minutes || 0;
+    });
+    // Si no hay sesiones en el array global, usa las de la semana calculadas antes
+    if (totalMinutes === 0 && typeof weeklyStudyMinutes !== 'undefined') {
+      totalMinutes = weeklyStudyMinutes;
+    }
+
+    const studyHours = totalMinutes / 60;
+
+    // 4. Bonus por esfuerzo: Cada 1 hora de estudio suma +0.1 al promedio (tope de +2.5)
+    const studyBonus = Math.min(2.5, studyHours * 0.1);
+
+    // 5. Promedio final combinado (tope máximo de 10.0)
+    let finalAverage = Math.min(10.0, baseAverage + studyBonus);
+
+    // Inyectar en el elemento HTML del GPA
+    const gpaElement = document.getElementById('dash-gpa');
+    if (gpaElement) {
+      gpaElement.textContent = `${finalAverage.toFixed(1)} / 10`;
+    }
+    this.renderDashboardSegments(state, metrics);
   }
 
+  renderDashboardSegments(state, metrics) {
+    // 1. Materias Preview List
+    const materiasContainer = document.getElementById('dash-segment-materias');
+    if (materiasContainer) {
+      if (state.subjects.length === 0) {
+        materiasContainer.innerHTML = `<p class="text-sm text-slate-500 py-4">No hay materias registradas. ¡Agrega una para comenzar!</p>`;
+      } else {
+        materiasContainer.innerHTML = state.subjects.slice(0, 3).map(sub => {
+          const prog = this.store.getSubjectProgress(sub);
+          const completedCount = sub.tasks.filter(t => t.completed).length;
+          return `
+            <div class="flex items-center justify-between p-3.5 bg-slate-50 hover:bg-slate-100/80 rounded-xl transition border border-slate-200/60 cursor-pointer" onclick="window.visariApp.navigateTo('materia-detail', '${sub.id}')">
+              <div class="flex items-center gap-3">
+                <span class="w-3 h-3 rounded-full" style="background-color: ${sub.accent || '#8B5CF6'}"></span>
+                <div>
+                  <h4 class="text-sm font-semibold text-slate-900">${sub.name}</h4>
+                  <p class="text-xs text-slate-500">${sub.code} • ${completedCount}/${sub.tasks.length} actividades</p>
+                </div>
+              </div>
+              <div class="flex items-center gap-3">
+                <div class="w-20 bg-slate-200 rounded-full h-2 overflow-hidden">
+                  <div class="h-full bg-violet-600 rounded-full transition-all duration-500" style="width: ${prog}%"></div>
+                </div>
+                <span class="text-xs font-bold text-slate-700 w-8 text-right">${prog}%</span>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+    }
 
-  // 2. Cronómetro Botón B Widget
-  const timerWidgetBtn = document.getElementById('dash-segment-timer-btn');
-  const timerStatusLabel = document.getElementById('dash-timer-status-label');
-  if(timerWidgetBtn && timerStatusLabel) {
-  if (this.store.timer.isRunning) {
-    timerStatusLabel.textContent = `En curso: ${this.formatSeconds(this.store.timer.seconds)}`;
-    timerWidgetBtn.innerHTML = `
+    // 2. Cronómetro Botón V Widget
+    const timerWidgetBtn = document.getElementById('dash-segment-timer-btn');
+    const timerStatusLabel = document.getElementById('dash-timer-status-label');
+    if (timerWidgetBtn && timerStatusLabel) {
+      if (this.store.timer.isRunning) {
+        timerStatusLabel.textContent = `En curso: ${this.formatSeconds(this.store.timer.seconds)}`;
+        timerWidgetBtn.innerHTML = `
           <span class="flex items-center gap-2 text-rose-500 font-semibold">
             <span class="w-3 h-3 rounded-full bg-rose-500 animate-ping"></span>
             Detener & Asignar
           </span>
         `;
-    timerWidgetBtn.onclick = () => {
-      this.navigateTo('timer');
-      this.stopTimerPrompt();
-    };
-  } else {
-    timerStatusLabel.textContent = "Listo para una nueva sesión";
-    timerWidgetBtn.innerHTML = `
+        timerWidgetBtn.onclick = () => {
+          this.navigateTo('timer');
+          this.stopTimerPrompt();
+        };
+      } else {
+        timerStatusLabel.textContent = "Listo para una nueva sesión";
+        timerWidgetBtn.innerHTML = `
           <span class="flex items-center gap-2 text-violet-600 font-semibold">
             ⚡ Iniciar Cronómetro
           </span>
         `;
-    timerWidgetBtn.onclick = () => {
-      this.navigateTo('timer');
-    };
-  }
-}
+        timerWidgetBtn.onclick = () => {
+          this.navigateTo('timer');
+        };
+      }
+    }
 
-// 3. Calendario Preview (Next upcoming milestones)
-const calContainer = document.getElementById('dash-segment-calendar');
-if (calContainer) {
-  if (metrics.upcomingExams.length === 0) {
-    calContainer.innerHTML = `<p class="text-sm text-slate-500 py-3">No hay exámenes ni entregas urgentes próximas.</p>`;
-  } else {
-    calContainer.innerHTML = metrics.upcomingExams.slice(0, 3).map(exam => {
-      const typeBadge = exam.type === 'parcial'
-        ? '<span class="bg-amber-100 text-amber-800 text-[10px] font-bold px-2 py-0.5 rounded-full">PARCIAL</span>'
-        : '<span class="bg-rose-100 text-rose-800 text-[10px] font-bold px-2 py-0.5 rounded-full">FINAL</span>';
-      return `
+    // 3. Calendario Preview (Next upcoming milestones)
+    const calContainer = document.getElementById('dash-segment-calendar');
+    if (calContainer) {
+      if (metrics.upcomingExams.length === 0) {
+        calContainer.innerHTML = `<p class="text-sm text-slate-500 py-3">No hay exámenes ni entregas urgentes próximas.</p>`;
+      } else {
+        calContainer.innerHTML = metrics.upcomingExams.slice(0, 3).map(exam => {
+          const typeBadge = exam.type === 'parcial'
+            ? '<span class="bg-amber-100 text-amber-800 text-[10px] font-bold px-2 py-0.5 rounded-full">PARCIAL</span>'
+            : '<span class="bg-rose-100 text-rose-800 text-[10px] font-bold px-2 py-0.5 rounded-full">FINAL</span>';
+          return `
             <div class="flex items-center justify-between p-3 bg-white rounded-xl border border-slate-200/80 shadow-sm">
               <div class="flex items-center gap-2.5">
                 <div class="w-2.5 h-2.5 rounded-full" style="background-color: ${exam.subjectColor}"></div>
@@ -1233,18 +1776,18 @@ if (calContainer) {
               </div>
             </div>
           `;
-    }).join('');
-  }
-}
+        }).join('');
+      }
+    }
 
-// 4. Team Preview
-const teamContainer = document.getElementById('dash-segment-team');
-if (teamContainer) {
-  const activeTasks = state.team.tasks.filter(t => t.status !== 'done');
-  const doneCount = state.team.tasks.filter(t => t.status === 'done').length;
-  const teamProg = state.team.tasks.length > 0 ? Math.round((doneCount / state.team.tasks.length) * 100) : 0;
+    // 4. Team Preview
+    const teamContainer = document.getElementById('dash-segment-team');
+    if (teamContainer) {
+      const activeTasks = state.team.tasks.filter(t => t.status !== 'done');
+      const doneCount = state.team.tasks.filter(t => t.status === 'done').length;
+      const teamProg = state.team.tasks.length > 0 ? Math.round((doneCount / state.team.tasks.length) * 100) : 0;
 
-  teamContainer.innerHTML = `
+      teamContainer.innerHTML = `
         <div class="space-y-3">
           <div class="flex items-center justify-between">
             <span class="text-xs font-medium text-slate-500">Progreso del sprint grupal</span>
@@ -1265,18 +1808,18 @@ if (teamContainer) {
           </div>
         </div>
       `;
-}
+    }
   }
 
-// ==========================================
-// VIEW 4: MATERIAS (OVERVIEW & DETAIL)
-// ==========================================
-renderMaterias(state) {
-  const grid = document.getElementById('materias-grid');
-  if (!grid) return;
+  // ==========================================
+  // VIEW 4: MATERIAS (OVERVIEW & DETAIL)
+  // ==========================================
+  renderMaterias(state) {
+    const grid = document.getElementById('materias-grid');
+    if (!grid) return;
 
-  if (state.subjects.length === 0) {
-    grid.innerHTML = `
+    if (state.subjects.length === 0) {
+      grid.innerHTML = `
         <div class="col-span-full py-16 text-center bg-white rounded-2xl border border-dashed border-slate-300">
           <p class="text-slate-500 font-medium">No has registrado materias aún.</p>
           <button class="mt-4 px-4 py-2 bg-violet-600 text-white text-sm font-semibold rounded-xl hover:bg-violet-700 transition" onclick="window.visariApp.openNewSubjectModal()">
@@ -1284,18 +1827,18 @@ renderMaterias(state) {
           </button>
         </div>
       `;
-    return;
-  }
+      return;
+    }
 
-  grid.innerHTML = state.subjects.map(subject => {
-    const progress = this.store.getSubjectProgress(subject);
-    const totalTasks = subject.tasks.length;
-    const completedTasks = subject.tasks.filter(t => t.completed).length;
-    const hours = Math.floor(subject.studyMinutes / 60);
-    const mins = subject.studyMinutes % 60;
-    const studyTimeStr = `${hours}h ${mins > 0 ? mins + 'm' : ''}`;
+    grid.innerHTML = state.subjects.map(subject => {
+      const progress = this.store.getSubjectProgress(subject);
+      const totalTasks = subject.tasks.length;
+      const completedTasks = subject.tasks.filter(t => t.completed).length;
+      const hours = Math.floor(subject.studyMinutes / 60);
+      const mins = subject.studyMinutes % 60;
+      const studyTimeStr = `${hours}h ${mins > 0 ? mins + 'm' : ''}`;
 
-    return `
+      return `
         <div class="bg-white rounded-2xl p-6 border border-slate-200/80 shadow-sm hover:shadow-md transition-all duration-200 flex flex-col justify-between group">
           <div>
             <div class="flex items-start justify-between mb-4">
@@ -1336,335 +1879,335 @@ renderMaterias(state) {
             </button>
             <button class="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition" title="Eliminar Materia" onclick="window.visariApp.confirmDeleteSubject('${subject.id}')">
               🗑️
-            </button>
+</button>
           </div>
         </div>
       `;
-  }).join('');
-}
-
-renderMateriaDetail(state) {
-  const subject = state.subjects.find(s => s.id === this.selectedSubjectDetail);
-  if (!subject) {
-    this.navigateTo('materias');
-    return;
+    }).join('');
   }
 
-  const progress = this.store.getSubjectProgress(subject);
-  const completedTasks = subject.tasks.filter(t => t.completed).length;
-  const hours = Math.floor(subject.studyMinutes / 60);
-  const mins = subject.studyMinutes % 60;
+  renderMateriaDetail(state) {
+    const subject = state.subjects.find(s => s.id === this.selectedSubjectDetail);
+    if (!subject) {
+      this.navigateTo('materias');
+      return;
+    }
 
-  // Header info
-  document.getElementById('materia-detail-code').textContent = subject.code;
-  document.getElementById('materia-detail-name').textContent = subject.name;
-  document.getElementById('materia-detail-prof').textContent = `Profesor: ${subject.professor} • ${subject.credits} Créditos`;
-  document.getElementById('materia-detail-hours').textContent = `${hours}h ${mins > 0 ? mins + 'm' : ''}`;
-  document.getElementById('materia-detail-progress-num').textContent = `${progress}%`;
-  document.getElementById('materia-detail-progress-bar').style.width = `${progress}%`;
-  document.getElementById('materia-detail-ratio').textContent = `${completedTasks} de ${subject.tasks.length} actividades completadas`;
+    const progress = this.store.getSubjectProgress(subject);
+    const completedTasks = subject.tasks.filter(t => t.completed).length;
+    const hours = Math.floor(subject.studyMinutes / 60);
+    const mins = subject.studyMinutes % 60;
 
-  // Tasks list
-  const tasksContainer = document.getElementById('materia-detail-tasks');
-  if (tasksContainer) {
-    if (subject.tasks.length === 0) {
-      tasksContainer.innerHTML = `<p class="text-sm text-slate-400 py-6 text-center">No hay actividades creadas para esta materia aún.</p>`;
-    } else {
-      tasksContainer.innerHTML = subject.tasks.map(task => {
-        const typeLabels = {
-          tarea: { text: "Tarea", cls: "bg-blue-50 text-blue-700 border-blue-200" },
-          entrega: { text: "Entrega TP", cls: "bg-purple-50 text-purple-700 border-purple-200" },
-          foro: { text: "Foro / Debate", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
-          lectura: { text: "📖 Lectura Diaria", cls: "bg-teal-50 text-teal-800 border-teal-300 font-bold" },
-          parcial: { text: "Examen Parcial", cls: "bg-amber-50 text-amber-700 border-amber-200" },
-          final: { text: "Examen Final", cls: "bg-rose-50 text-rose-700 border-rose-200" }
-        };
-        const badge = typeLabels[task.type] || typeLabels.tarea;
+    // Header info
+    document.getElementById('materia-detail-code').textContent = subject.code;
+    document.getElementById('materia-detail-name').textContent = subject.name;
+    document.getElementById('materia-detail-prof').textContent = `Profesor: ${subject.professor} • ${subject.credits} Créditos`;
+    document.getElementById('materia-detail-hours').textContent = `${hours}h ${mins > 0 ? mins + 'm' : ''}`;
+    document.getElementById('materia-detail-progress-num').textContent = `${progress}%`;
+    document.getElementById('materia-detail-progress-bar').style.width = `${progress}%`;
+    document.getElementById('materia-detail-ratio').textContent = `${completedTasks} de ${subject.tasks.length} actividades completadas`;
 
-        return `
-            <div class="flex items-center justify-between p-3.5 bg-white hover:bg-slate-50/80 rounded-xl border border-slate-200/80 transition group ${task.completed ? 'opacity-70 bg-slate-50/50' : ''}">
-              <div class="flex items-center gap-3.5">
-                <input 
-                  type="checkbox" 
-                  ${task.completed ? 'checked' : ''} 
-                  class="w-5 h-5 rounded-md text-violet-600 focus:ring-violet-500 border-slate-300 cursor-pointer transition"
-                  onchange="window.visariApp.store.toggleTask('${subject.id}', '${task.id}')"
-                />
-                <div>
-                  <h4 class="text-sm font-semibold text-slate-900 ${task.completed ? 'line-through text-slate-500' : ''}">
-                    ${task.title}
-                  </h4>
+    // Tasks list
+    const tasksContainer = document.getElementById('materia-detail-tasks');
+    if (tasksContainer) {
+      if (subject.tasks.length === 0) {
+        tasksContainer.innerHTML = `<p class="text-sm text-slate-400 py-6 text-center">No hay actividades creadas para esta materia aún.</p>`;
+      } else {
+        tasksContainer.innerHTML = subject.tasks.map(task => {
+          const typeLabels = {
+            tarea: { text: "Tarea", cls: "bg-blue-50 text-blue-700 border-blue-200" },
+            entrega: { text: "Entrega TP", cls: "bg-purple-50 text-purple-700 border-purple-200" },
+            foro: { text: "Foro / Debate", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
+            lectura: { text: "📖 Lectura Diaria", cls: "bg-teal-50 text-teal-800 border-teal-300 font-bold" },
+            parcial: { text: "Examen Parcial", cls: "bg-amber-50 text-amber-700 border-amber-200" },
+            final: { text: "Examen Final", cls: "bg-rose-50 text-rose-700 border-rose-200" }
+          };
+          const badge = typeLabels[task.type] || typeLabels.tarea;
+
+          return `
+                        <div class="flex items-center justify-between p-3.5 bg-white hover:bg-slate-50/80 rounded-xl border border-slate-200/80 transition group ${task.completed ? 'opacity-70 bg-slate-50/50' : ''}">
+                            <div class="flex items-center gap-3.5">
+                                <input 
+                                    type="checkbox" 
+                                    ${task.completed ? 'checked' : ''} 
+                                    class="w-5 h-5 rounded-md text-violet-600 focus:ring-violet-500 border-slate-300 cursor-pointer transition"
+                                    onchange="window.visariApp.store.toggleTask('${subject.id}', '${task.id}')"
+                                />
+                                <div>
+                                    <h4 class="text-sm font-semibold text-slate-900 ${task.completed ? 'line-through text-slate-500' : ''}">
+                                        ${task.title}
+                                    </h4>
                   <div class="flex items-center gap-2 mt-0.5">
                     <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border ${badge.cls}">${badge.text}</span>
                     <span class="text-xs text-slate-400">📅 Límite: ${task.dueDate}</span>
                     ${task.grade ? `<span class="text-xs font-semibold text-emerald-600">Nota: ${task.grade}</span>` : ''}
                   </div>
-                </div>
-              </div>
-              <button 
-                class="opacity-0 group-hover:opacity-100 p-1.5 text-slate-400 hover:text-rose-600 transition" 
-                title="Eliminar actividad"
-                onclick="window.visariApp.store.deleteTask('${subject.id}', '${task.id}')">
-                ✕
-              </button>
-            </div>
-          `;
-      }).join('');
-    }
-  }
-}
-
-openNewSubjectModal() {
-  const modal = document.getElementById('modal-new-subject');
-  if (modal) modal.classList.remove('hidden');
-}
-
-closeNewSubjectModal() {
-  const modal = document.getElementById('modal-new-subject');
-  if (modal) modal.classList.add('hidden');
-}
-
-openNewTaskModal() {
-  const modal = document.getElementById('modal-new-task');
-  if (modal) modal.classList.remove('hidden');
-}
-
-closeNewTaskModal() {
-  const modal = document.getElementById('modal-new-task');
-  if (modal) modal.classList.add('hidden');
-}
-
-confirmDeleteSubject(subjectId) {
-  if (confirm("¿Estás seguro de que deseas eliminar esta materia? Esta acción recalculará todo el avance del Dashboard.")) {
-    this.store.deleteSubject(subjectId);
-  }
-}
-
-// ==========================================
-// VIEW 5: CRONÓMETRO / "BOTÓN B"
-// ==========================================
-renderTimerView(state) {
-  const timer = this.store.timer;
-  const timeDisplay = document.getElementById('main-timer-display');
-  const startBtn = document.getElementById('timer-start-btn');
-  const pauseBtn = document.getElementById('timer-pause-btn');
-  const stopBtn = document.getElementById('timer-stop-btn');
-  const timerCircle = document.getElementById('timer-container-circle');
-
-  if (timeDisplay) timeDisplay.textContent = this.formatSeconds(timer.seconds);
-
-  if (timerCircle) {
-    if (timer.isRunning) {
-      timerCircle.classList.add('timer-running-glow', 'border-violet-500');
-      timerCircle.classList.remove('border-slate-200');
-    } else {
-      timerCircle.classList.remove('timer-running-glow', 'border-violet-500');
-      timerCircle.classList.add('border-slate-200');
-    }
-  }
-
-  if (startBtn && pauseBtn && stopBtn) {
-    if (timer.isRunning) {
-      startBtn.classList.add('hidden');
-      pauseBtn.classList.remove('hidden');
-      stopBtn.removeAttribute('disabled');
-      stopBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-    } else {
-      startBtn.classList.remove('hidden');
-      pauseBtn.classList.add('hidden');
-      if (timer.seconds === 0) {
-        stopBtn.setAttribute('disabled', 'true');
-        stopBtn.classList.add('opacity-50', 'cursor-not-allowed');
-      } else {
-        stopBtn.removeAttribute('disabled');
-        stopBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                                </div>
+                            </div>
+                            <button 
+                                class="opacity-0 group-hover:opacity-100 p-1.5 text-slate-400 hover:text-rose-600 transition" 
+                                title="Eliminar actividad"
+                                onclick="window.visariApp.store.deleteTask('${subject.id}', '${task.id}')">
+                                ✕
+                            </button>
+                        </div>
+                    `;
+        }).join('');
       }
     }
   }
 
-  // Populate subject selector dropdown
-  const subSelect = document.getElementById('timer-subject-select');
-  if (subSelect) {
-    subSelect.innerHTML = `<option value="">-- Elige una materia --</option>` + state.subjects.map(s => `
-        <option value="${s.id}">${s.name} (${s.code})</option>
-      `).join('');
+  openNewSubjectModal() {
+    const modal = document.getElementById('modal-new-subject');
+    if (modal) modal.classList.remove('hidden');
   }
-}
 
-startTimer() {
-  if (this.store.timer.isRunning) return;
-  this.store.timer.isRunning = true;
+  closeNewSubjectModal() {
+    const modal = document.getElementById('modal-new-subject');
+    if (modal) modal.classList.add('hidden');
+  }
 
-  this.timerTicker = setInterval(() => {
-    this.store.timer.seconds++;
+  openNewTaskModal() {
+    const modal = document.getElementById('modal-new-task');
+    if (modal) modal.classList.remove('hidden');
+  }
+
+  closeNewTaskModal() {
+    const modal = document.getElementById('modal-new-task');
+    if (modal) modal.classList.add('hidden');
+  }
+
+  confirmDeleteSubject(subjectId) {
+    if (confirm("¿Estás seguro de que deseas eliminar esta materia? Esta acción recalculará todo el avance del Dashboard.")) {
+      this.store.deleteSubject(subjectId);
+    }
+  }
+
+  // ==========================================
+  // VIEW 5: CRONÓMETRO / "BOTÓN B"
+  // ==========================================
+  renderTimerView(state) {
+    const timer = this.store.timer;
     const timeDisplay = document.getElementById('main-timer-display');
-    if (timeDisplay) timeDisplay.textContent = this.formatSeconds(this.store.timer.seconds);
+    const startBtn = document.getElementById('timer-start-btn');
+    const pauseBtn = document.getElementById('timer-pause-btn');
+    const stopBtn = document.getElementById('timer-stop-btn');
+    const timerCircle = document.getElementById('timer-container-circle');
 
-    const topDisplay = document.getElementById('topbar-timer-display');
-    if (topDisplay) topDisplay.textContent = this.formatSeconds(this.store.timer.seconds);
-  }, 1000);
+    if (timeDisplay) timeDisplay.textContent = this.formatSeconds(timer.seconds);
 
-  this.render();
-}
+    if (timerCircle) {
+      if (timer.isRunning) {
+        timerCircle.classList.add('timer-running-glow', 'border-violet-500');
+        timerCircle.classList.remove('border-slate-200');
+      } else {
+        timerCircle.classList.remove('timer-running-glow', 'border-violet-500');
+        timerCircle.classList.add('border-slate-200');
+      }
+    }
 
-pauseTimer() {
-  this.store.timer.isRunning = false;
-  clearInterval(this.timerTicker);
-  this.render();
-}
+    if (startBtn && pauseBtn && stopBtn) {
+      if (timer.isRunning) {
+        startBtn.classList.add('hidden');
+        pauseBtn.classList.remove('hidden');
+        stopBtn.removeAttribute('disabled');
+        stopBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+      } else {
+        startBtn.classList.remove('hidden');
+        pauseBtn.classList.add('hidden');
+        if (timer.seconds === 0) {
+          stopBtn.setAttribute('disabled', 'true');
+          stopBtn.classList.add('opacity-50', 'cursor-not-allowed');
+        } else {
+          stopBtn.removeAttribute('disabled');
+          stopBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+        }
+      }
+    }
 
-resetTimer() {
-  this.pauseTimer();
-  this.store.timer.seconds = 0;
-  this.render();
-}
-
-stopTimerPrompt() {
-  this.pauseTimer();
-  if (this.store.timer.seconds < 1) {
-    this.store.showToast("Inicia el cronómetro antes de asignar tiempo.");
-    return;
-  }
-
-  // Populate stop modal
-  const modal = document.getElementById('modal-assign-study-time');
-  const minsRecorded = Math.max(1, Math.round(this.store.timer.seconds / 60));
-  const timeSummary = document.getElementById('assign-time-summary');
-  if (timeSummary) {
-    timeSummary.textContent = `${this.formatSeconds(this.store.timer.seconds)} (~${minsRecorded} min)`;
-  }
-
-  const selectEl = document.getElementById('assign-subject-select');
-  if (selectEl) {
-    selectEl.innerHTML = this.store.state.subjects.map(s => `
+    // Populate subject selector dropdown
+    const subSelect = document.getElementById('timer-subject-select');
+    if (subSelect) {
+      subSelect.innerHTML = `<option value="">-- Elige una materia --</option>` + state.subjects.map(s => `
         <option value="${s.id}">${s.name} (${s.code})</option>
       `).join('');
+    }
   }
 
-  if (modal) modal.classList.remove('hidden');
-}
+  startTimer() {
+    if (this.store.timer.isRunning) return;
+    this.store.timer.isRunning = true;
 
-confirmAssignStudyTime() {
-  const selectEl = document.getElementById('assign-subject-select');
-  const subjectId = selectEl.value;
-  const minsRecorded = Math.max(1, Math.round(this.store.timer.seconds / 60));
+    this.timerTicker = setInterval(() => {
+      this.store.timer.seconds++;
+      const timeDisplay = document.getElementById('main-timer-display');
+      if (timeDisplay) timeDisplay.textContent = this.formatSeconds(this.store.timer.seconds);
 
-  if (!subjectId) {
-    alert("Por favor selecciona una materia");
-    return;
+      const topDisplay = document.getElementById('topbar-timer-display');
+      if (topDisplay) topDisplay.textContent = this.formatSeconds(this.store.timer.seconds);
+    }, 1000);
+
+    this.render();
   }
 
-  this.store.addStudyTime(subjectId, minsRecorded);
-  this.store.triggerConfetti();
+  pauseTimer() {
+    this.store.timer.isRunning = false;
+    clearInterval(this.timerTicker);
+    this.render();
+  }
 
-  // Reset timer
-  this.store.timer.seconds = 0;
-  this.store.timer.isRunning = false;
+  resetTimer() {
+    this.pauseTimer();
+    this.store.timer.seconds = 0;
+    this.render();
+  }
 
-  // Close modal
-  const modal = document.getElementById('modal-assign-study-time');
-  if (modal) modal.classList.add('hidden');
+  stopTimerPrompt() {
+    this.pauseTimer();
+    if (this.store.timer.seconds < 1) {
+      this.store.showToast("Inicia el cronómetro antes de asignar tiempo.");
+      return;
+    }
 
-  this.render();
-}
+    // Populate stop modal
+    const modal = document.getElementById('modal-assign-study-time');
+    const minsRecorded = Math.max(1, Math.round(this.store.timer.seconds / 60));
+    const timeSummary = document.getElementById('assign-time-summary');
+    if (timeSummary) {
+      timeSummary.textContent = `${this.formatSeconds(this.store.timer.seconds)} (~${minsRecorded} min)`;
+    }
 
-formatSeconds(totalSecs) {
-  const hrs = Math.floor(totalSecs / 3600);
-  const mins = Math.floor((totalSecs % 3600) / 60);
-  const secs = totalSecs % 60;
-  return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-}
+    const selectEl = document.getElementById('assign-subject-select');
+    if (selectEl) {
+      selectEl.innerHTML = this.store.state.subjects.map(s => `
+        <option value="${s.id}">${s.name} (${s.code})</option>
+      `).join('');
+    }
 
-// ==========================================
-// VIEW 6: CALENDARIO
-// ==========================================
-renderCalendar(state) {
-  const year = this.currentCalendarDate.getFullYear();
-  const month = this.currentCalendarDate.getMonth();
+    if (modal) modal.classList.remove('hidden');
+  }
 
-  const monthNames = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
-  const monthLabel = document.getElementById('calendar-month-label');
-  if (monthLabel) monthLabel.textContent = `${monthNames[month]} ${year}`;
+  confirmAssignStudyTime() {
+    const selectEl = document.getElementById('assign-subject-select');
+    const subjectId = selectEl.value;
+    const minsRecorded = Math.max(1, Math.round(this.store.timer.seconds / 60));
 
-  // Collect all events from subjects
-  const allEvents = [];
-  state.subjects.forEach(sub => {
-    (sub.tasks || []).forEach(task => {
-      allEvents.push({
-        ...task,
-        subjectName: sub.name,
-        subjectCode: sub.code,
-        subjectColor: sub.accent || '#8B5CF6'
+    if (!subjectId) {
+      alert("Por favor selecciona una materia");
+      return;
+    }
+
+    this.store.addStudyTime(subjectId, minsRecorded);
+    this.store.triggerConfetti();
+
+    // Reset timer
+    this.store.timer.seconds = 0;
+    this.store.timer.isRunning = false;
+
+    // Close modal
+    const modal = document.getElementById('modal-assign-study-time');
+    if (modal) modal.classList.add('hidden');
+
+    this.render();
+  }
+
+  formatSeconds(totalSecs) {
+    const hrs = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    const secs = totalSecs % 60;
+    return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  // ==========================================
+  // VIEW 6: CALENDARIO
+  // ==========================================
+  renderCalendar(state) {
+    const year = this.currentCalendarDate.getFullYear();
+    const month = this.currentCalendarDate.getMonth();
+
+    const monthNames = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+    const monthLabel = document.getElementById('calendar-month-label');
+    if (monthLabel) monthLabel.textContent = `${monthNames[month]} ${year}`;
+
+    // Collect all events from subjects
+    const allEvents = [];
+    state.subjects.forEach(sub => {
+      (sub.tasks || []).forEach(task => {
+        allEvents.push({
+          ...task,
+          subjectName: sub.name,
+          subjectCode: sub.code,
+          subjectColor: sub.accent || '#8B5CF6'
+        });
       });
     });
-  });
 
-  // Calendar Grid Days
-  const gridEl = document.getElementById('calendar-days-grid');
-  if (!gridEl) return;
+    // Calendar Grid Days
+    const gridEl = document.getElementById('calendar-days-grid');
+    if (!gridEl) return;
 
-  gridEl.innerHTML = '';
+    gridEl.innerHTML = '';
 
-  const firstDay = new Date(year, month, 1).getDay(); // 0 is Sunday
-  // Adjust so Monday is 0
-  const startOffset = firstDay === 0 ? 6 : firstDay - 1;
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const firstDay = new Date(year, month, 1).getDay(); // 0 is Sunday
+    // Adjust so Monday is 0
+    const startOffset = firstDay === 0 ? 6 : firstDay - 1;
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
 
-  // Empty offset cells
-  for (let i = 0; i < startOffset; i++) {
-    const emptyCell = document.createElement('div');
-    emptyCell.className = 'h-24 bg-slate-50/50 rounded-xl border border-dashed border-slate-200/50';
-    gridEl.appendChild(emptyCell);
-  }
+    // Empty offset cells
+    for (let i = 0; i < startOffset; i++) {
+      const emptyCell = document.createElement('div');
+      emptyCell.className = 'h-24 bg-slate-50/50 rounded-xl border border-dashed border-slate-200/50';
+      gridEl.appendChild(emptyCell);
+    }
 
-  const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = new Date().toISOString().split('T')[0];
 
-  // Day cells
-  for (let day = 1; day <= daysInMonth; day++) {
-    const dateStr = `${year}-${(month + 1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
-    const isToday = dateStr === todayStr;
+    // Day cells
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dateStr = `${year}-${(month + 1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
+      const isToday = dateStr === todayStr;
 
-    const dayEvents = allEvents.filter(e => e.dueDate === dateStr);
+      const dayEvents = allEvents.filter(e => e.dueDate === dateStr);
 
-    const cell = document.createElement('div');
-    cell.className = `h-28 p-2 rounded-xl border transition-all flex flex-col justify-between cursor-pointer ${isToday
-      ? 'bg-violet-50/60 border-violet-400 ring-2 ring-violet-400/20'
-      : 'bg-white border-slate-200/80 hover:border-violet-300 hover:shadow-sm'
-      }`;
+      const cell = document.createElement('div');
+      cell.className = `h-28 p-2 rounded-xl border transition-all flex flex-col justify-between cursor-pointer ${isToday
+        ? 'bg-violet-50/60 border-violet-400 ring-2 ring-violet-400/20'
+        : 'bg-white border-slate-200/80 hover:border-violet-300 hover:shadow-sm'
+        }`;
 
-    cell.innerHTML = `
+      cell.innerHTML = `
         <div class="flex items-center justify-between">
           <span class="text-xs font-bold ${isToday ? 'text-violet-700 bg-violet-200/70 w-5 h-5 flex items-center justify-center rounded-full' : 'text-slate-700'}">${day}</span>
           ${dayEvents.length > 0 ? `<span class="text-[10px] font-bold text-violet-600 bg-violet-100 px-1.5 py-0.2 rounded-full">${dayEvents.length}</span>` : ''}
         </div>
         <div class="space-y-1 overflow-hidden flex-1 mt-1">
           ${dayEvents.slice(0, 2).map(ev => {
-      const isExam = ev.type === 'parcial' || ev.type === 'final';
-      const isLectura = ev.type === 'lectura';
-      const pillCls = isExam
-        ? 'bg-amber-100 text-amber-900 font-semibold'
-        : isLectura
-          ? 'bg-teal-100 text-teal-900 font-semibold border border-teal-200'
-          : 'bg-slate-100 text-slate-700';
-      return `
+        const isExam = ev.type === 'parcial' || ev.type === 'final';
+        const isLectura = ev.type === 'lectura';
+        const pillCls = isExam
+          ? 'bg-amber-100 text-amber-900 font-semibold'
+          : isLectura
+            ? 'bg-teal-100 text-teal-900 font-semibold border border-teal-200'
+            : 'bg-slate-100 text-slate-700';
+        return `
               <div class="text-[10px] px-1.5 py-0.5 rounded truncate font-medium ${pillCls}" title="${ev.title} (${ev.subjectCode})">
                 ${isLectura ? '📖 ' : ''}${ev.title}
               </div>
             `;
-    }).join('')}
+      }).join('')}
           ${dayEvents.length > 2 ? `<div class="text-[9px] text-slate-400 font-medium">+${dayEvents.length - 2} más</div>` : ''}
         </div>
       `;
 
-    cell.onclick = () => this.showCalendarDayEvents(dateStr, dayEvents);
-    gridEl.appendChild(cell);
-  }
+      cell.onclick = () => this.showCalendarDayEvents(dateStr, dayEvents);
+      gridEl.appendChild(cell);
+    }
 
-  // Side list: upcoming 5 events
-  const upcomingList = document.getElementById('calendar-upcoming-list');
-  if (upcomingList) {
-    const sortedEvents = [...allEvents].sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
-    upcomingList.innerHTML = sortedEvents.slice(0, 5).map(ev => `
+    // Side list: upcoming 5 events
+    const upcomingList = document.getElementById('calendar-upcoming-list');
+    if (upcomingList) {
+      const sortedEvents = [...allEvents].sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+      upcomingList.innerHTML = sortedEvents.slice(0, 5).map(ev => `
         <div class="p-3 bg-white rounded-xl border border-slate-200/80 shadow-sm flex items-center justify-between">
           <div class="flex items-center gap-2.5">
             <span class="w-2.5 h-2.5 rounded-full" style="background-color: ${ev.subjectColor}"></span>
@@ -1678,22 +2221,22 @@ renderCalendar(state) {
           </span>
         </div>
       `).join('');
+    }
   }
-}
 
-showCalendarDayEvents(dateStr, events) {
-  const detailBox = document.getElementById('calendar-day-detail-box');
-  const detailTitle = document.getElementById('calendar-day-detail-title');
-  const detailContent = document.getElementById('calendar-day-detail-content');
+  showCalendarDayEvents(dateStr, events) {
+    const detailBox = document.getElementById('calendar-day-detail-box');
+    const detailTitle = document.getElementById('calendar-day-detail-title');
+    const detailContent = document.getElementById('calendar-day-detail-content');
 
-  if (!detailBox) return;
-  detailBox.classList.remove('hidden');
-  detailTitle.textContent = `Eventos para el ${dateStr}`;
+    if (!detailBox) return;
+    detailBox.classList.remove('hidden');
+    detailTitle.textContent = `Eventos para el ${dateStr}`;
 
-  if (events.length === 0) {
-    detailContent.innerHTML = `<p class="text-xs text-slate-400 py-3">No hay actividades programadas para este día.</p>`;
-  } else {
-    detailContent.innerHTML = events.map(ev => `
+    if (events.length === 0) {
+      detailContent.innerHTML = `<p class="text-xs text-slate-400 py-3">No hay actividades programadas para este día.</p>`;
+    } else {
+      detailContent.innerHTML = events.map(ev => `
         <div class="p-2.5 bg-slate-50 rounded-lg border border-slate-200 flex items-center justify-between">
           <div>
             <p class="text-xs font-bold text-slate-800">${ev.title}</p>
@@ -1704,175 +2247,993 @@ showCalendarDayEvents(dateStr, events) {
           </span>
         </div>
       `).join('');
+    }
   }
-}
 
-prevMonth() {
-  this.currentCalendarDate.setMonth(this.currentCalendarDate.getMonth() - 1);
-  this.render();
-}
+  prevMonth() {
+    this.currentCalendarDate.setMonth(this.currentCalendarDate.getMonth() - 1);
+    this.render();
+  }
 
-nextMonth() {
-  this.currentCalendarDate.setMonth(this.currentCalendarDate.getMonth() + 1);
-  this.render();
-}
+  nextMonth() {
+    this.currentCalendarDate.setMonth(this.currentCalendarDate.getMonth() + 1);
+    this.render();
+  }
 
-  // =====================================
-  // VIEW 7: TRABAJO EN EQUIPO
-  // =====================================
 
-  // 1. Método para sumar compañero por email
-  async addTeamMemberPrompt() {
-  const email = prompt("Ingresá el correo electrónico registrado de tu compañero:");
-  if (!email) return;
+  // 3. Mover tareas en el tablero Kanban
+  async moveTeamTask(taskId, newStatus) {
+    const validStatuses = ["todo", "in_progress", "done"];
 
-  try {
-    const usersRef = collection(db, "users");
-    const q = query(usersRef, where("email", "==", email.trim().toLowerCase()));
-    const querySnapshot = await getDocs(q);
-
-    if (querySnapshot.empty) {
-      alert("El usuario aún no está registrado en VISARi.");
+    if (!validStatuses.includes(newStatus)) {
+      console.error("Estado de tarea inválido:", newStatus);
       return;
     }
 
-    let memberData = null;
-    querySnapshot.forEach((doc) => {
-      memberData = doc.data();
-    });
+    const currentUser = auth.currentUser;
 
-    if (!this.store.state.team) {
-      this.store.state.team = { members: [], tasks: [] };
-    }
-
-    if (this.store.state.team.members.some(m => m.email === memberData.email)) {
-      alert("Este compañero ya forma parte de tu equipo.");
+    if (!currentUser) {
+      this.store.showToast("Iniciá sesión para mover la tarea.");
       return;
     }
 
-    this.store.state.team.members.push({
-      name: memberData.name || "Compañero",
-      email: memberData.email,
-      role: memberData.career || "Colaborador",
-      avatar: memberData.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(memberData.name)}`
-    });
+    try {
+      const taskRef = doc(db, "team_tasks", taskId);
+      const taskSnap = await getDoc(taskRef);
 
-    this.store.saveState();
-    this.renderTeam(this.store.state);
-    alert(`¡${memberData.name} fue agregado con éxito!`);
+      if (!taskSnap.exists()) {
+        this.store.showToast("La tarea ya no existe.");
+        return;
+      }
 
-  } catch (error) {
-    console.error("Error al buscar compañero:", error);
-    alert("Ocurrió un error al verificar el correo.");
+      const taskData = taskSnap.data();
+
+      // Verificar si el usuario pertenece al equipo.
+      let authorized = taskData.ownerUid === currentUser.uid;
+
+      if (!authorized) {
+        const membershipQuery = query(
+          collection(db, "subject_members"),
+          where("subjectId", "==", String(taskData.subjectId)),
+          where("ownerUid", "==", taskData.ownerUid),
+          where("memberUid", "==", currentUser.uid)
+        );
+
+        const membershipSnapshot = await getDocs(membershipQuery);
+
+        authorized = !membershipSnapshot.empty;
+      }
+
+      if (!authorized) {
+        this.store.showToast("No tenés permiso para modificar esta tarea.");
+        return;
+      }
+
+      await updateDoc(taskRef, {
+        status: newStatus
+      });
+
+      const task = this.store.state.team.tasks.find(
+        t => t.id === taskId
+      );
+
+      if (task) {
+        task.status = newStatus;
+      }
+
+      this.store.saveState();
+
+      // Actualizar el tablero Kanban
+      this.renderTeam(this.store.state);
+
+      // Actualizar el dashboard si está visible
+      if (this.currentView === 'dashboard') {
+        this.renderDashboard(this.store.state);
+      }
+
+      this.store.showToast("Estado de la tarea actualizado.");
+    } catch (error) {
+      console.error("Error al mover la tarea:", error);
+      this.store.showToast("No se pudo actualizar el estado.");
+    }
   }
-}
+  // Método para renderizar la vista de equipo y tablero Kanban
+  renderTeam(state) {
+    if (!state || !state.team) return;
 
-// 2. Asignar nueva tarea grupal
-openNewTeamTaskModal() {
-  const title = prompt("Título de la tarea o actividad:");
-  if (!title) return;
+    const team = state.team;
+    document.getElementById('team-project-title').textContent = team.projectName;
 
-  const subjectList = this.store.state.subjects.map(s => s.name).join("\n - ");
-  const subject = prompt(`¿A qué materia corresponde?\nDisponibles:\n - ${subjectList}`);
-  if (!subject) return;
+    // Team members avatars
+    const membersList = document.getElementById('team-members-list');
+    if (membersList) {
+      membersList.innerHTML = team.members.map(m => `
+      <div class="flex items-center gap-3 p-2.5 bg-white rounded-xl border border-slate-200/80 shadow-sm">
+        <img src="${m.avatar}" class="w-10 h-10 rounded-full object-cover border-2 border-violet-100" />
+        <div>
+          <h4 class="text-xs font-bold text-slate-900">${m.name}</h4>
+          <p class="text-[11px] text-slate-500">${m.role}</p>
+        </div>
+      </div>
+    `).join('');
+    }
 
-  if (!this.store.state.team) {
-    this.store.state.team = { members: [], tasks: [] };
-  }
+    // Selector de materia del tablero Kanban
+    const subjectSelect = document.querySelector('#view-team #team-board-subject-select');
+    console.log("SELECTOR ENCONTRADO:", subjectSelect);
+    console.log("ID DEL SELECTOR:", subjectSelect?.id);
+    console.log("CANTIDAD DE OPCIONES:", subjectSelect?.options.length);
+    const subjects = (Array.isArray(state.subjects) ? state.subjects : [])
+      .filter(subject => {
+        const currentUid = auth.currentUser?.uid;
 
-  const newTask = {
-    id: Date.now().toString(),
-    title: title,
-    subject: subject,
-    status: 'todo',
-    assignedTo: this.store.state.user.name
-  };
+        // Materias propias.
+        if (subject.ownerUid === currentUid) {
+          return true;
+        }
 
-  this.store.state.team.tasks.push(newTask);
-  this.store.saveState();
-  this.renderTeam(this.store.state);
-}
-// 3. Mover tareas en el tablero Kanban
-moveTeamTask(taskId, newStatus) {
-  const tasks = this.store.state.team.tasks || [];
-  const task = tasks.find(t => t.id === taskId);
-  if (task) {
-    task.status = newStatus;
-    this.store.saveState();
-    this.renderTeam(this.store.state);
-  }
-}
-// Método para renderizar la vista de equipo y tablero Kanban
-renderTeam(state) {
-  if (!state || !state.team) return;
-  const team = state.team;
+        // Materias compartidas por otro usuario.
+        if (
+          subject.isShared === true &&
+          subject.sharedOwnerUid
+        ) {
+          return true;
+        }
 
-  const projectTitle = document.getElementById('team-project-title');
-  if (projectTitle) projectTitle.textContent = team.projectName || "Proyecto Grupal";
+        // Materias antiguas sin propietario registrado.
+        if (!subject.ownerUid) {
+          return true;
+        }
 
-  // Team members avatars
-  const membersList = document.getElementById('team-members-list');
-  if (membersList) {
-    membersList.innerHTML = team.members.map(m => `
-                <div class="flex items-center gap-3 p-2.5 bg-white rounded-xl border border-slate-200/80 shadow-sm">
-                    <img src="${m.avatar}" class="w-10 h-10 rounded-full object-cover border-2 border-violet-100" />
-                    <div>
-                        <h4 class="text-xs font-bold text-slate-900">${m.name}</h4>
-                        <p class="text-[11px] text-slate-500">${m.role}</p>
-                    </div>
-                </div>
-            `).join('');
-  }
+        return false;
+      });
+    console.log("📚 Materias en el estado:", state.subjects);
+    console.log("📚 Materias que muestra el tablero:", subjects);
+    if (subjectSelect) {
+      const previousValue = subjectSelect.value;
 
-  // Populate Kanban Columns
-  const statuses = ['todo', 'in_progress', 'done'];
-  statuses.forEach(status => {
-    const col = document.getElementById(`kanban-col-${status}`);
-    if (!col) return;
+      subjectSelect.innerHTML = subjects.length
+        ? subjects.map(subject => `
+        <option value="${subject.id}">
+          ${subject.name}
+        </option>
+      `).join("")
+        : '<option value="">Primero agregá una materia</option>';
 
-    const tasks = team.tasks.filter(t => t.status === status);
-    col.innerHTML = tasks.length === 0
-      ? `<div class="p-4 text-center text-xs text-slate-400 border border-dashed border-slate-200 rounded-xl">Sin tareas</div>`
-      : tasks.map(task => {
-        const member = team.members.find(m => m.id === task.assigneeId) || { name: 'Sin asignar', avatar: '' };
-        const priorityCls = {
-          alta: 'bg-rose-100 text-rose-700',
-          media: 'bg-amber-100 text-amber-700',
-          baja: 'bg-slate-100 text-slate-700'
-        }[task.priority] || 'bg-slate-100 text-slate-700';
+      const selectedSubject = subjects.some(
+        subject => String(subject.id) === String(previousValue)
+      )
+        ? previousValue
+        : String(subjects[0]?.id || "");
 
-        return `
-                        <div class="p-3.5 bg-white rounded-xl border border-slate-200/80 shadow-sm hover:shadow-md transition-all">
-                            <div class="flex items-center justify-between mb-2">
-                                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${priorityCls}">${task.subject || 'General'}</span>
-                            </div>
-                            <h4 class="text-xs font-semibold text-slate-800 mb-2">${task.title}</h4>
-                            <div class="flex items-center justify-between text-[11px] text-slate-500 pt-2 border-t border-slate-100">
-                                <span>${member.name}</span>
+      subjectSelect.value = selectedSubject;
+      subjectSelect.disabled = subjects.length === 0;
+      console.log("Materias disponibles:", subjects.length, subjects.map(s => s.name));
+      console.log("Opciones del selector:", subjectSelect.options.length, "Valor seleccionado:", subjectSelect.value);
+
+      // Darle aspecto de título desplegable central.
+      subjectSelect.className =
+        "w-full max-w-2xl mx-auto block rounded-2xl border-2 " +
+        "border-violet-200 bg-white px-5 py-4 text-center " +
+        "text-2xl font-bold text-slate-900 shadow-sm " +
+        "focus:outline-none focus:ring-2 focus:ring-violet-500";
+
+      subjectSelect.setAttribute(
+        "aria-label",
+        "Seleccionar materia del tablero"
+      );
+
+      const parent = subjectSelect.parentElement;
+
+      if (parent) {
+        parent.classList.add(
+          "flex",
+          "flex-col",
+          "items-center",
+          "justify-center",
+          "w-full",
+          "py-5"
+        );
+      }
+    }
+    if (subjectSelect) {
+      subjectSelect.onchange = async event => {
+        const selectedSubjectId = event.target.value;
+
+        if (!selectedSubjectId) return;
+
+        this.selectedTeamTaskSubjectId = selectedSubjectId;
+
+        await this.loadTeamTasks(selectedSubjectId);
+        await this.loadTeamMembersFromFirebase(selectedSubjectId);
+
+        this.renderTeam(this.store.state);
+      };
+      // Cargar las tareas de la materia seleccionada al abrir el tablero.
+      const initialSubjectId = subjectSelect.value;
+
+      if (
+        initialSubjectId &&
+        this.selectedTeamTaskSubjectId !== initialSubjectId
+      ) {
+        this.selectedTeamTaskSubjectId = initialSubjectId;
+
+        this.loadTeamTasks(initialSubjectId).then(async () => {
+          await this.loadTeamMembersFromFirebase(initialSubjectId);
+          this.renderTeam(this.store.state);
+        });
+      }
+      // Populate Kanban Columns
+      const statuses = ['todo', 'in_progress', 'done'];
+      statuses.forEach(status => {
+        const col = document.getElementById(`kanban-col-${status}`);
+        if (!col) return;
+
+        const tasks = team.tasks.filter(t => t.status === status);
+        col.innerHTML = tasks.length === 0
+          ? `<div class="p-4 text-center text-xs text-slate-400 border border-dashed border-slate-200 rounded-xl">Sin tareas</div>`
+          : tasks.map(task => {
+            const member = team.members.find(m => m.id === task.assigneeId) || { name: 'Sin asignar', avatar: '' };
+            const priorityCls = {
+              alta: 'bg-rose-100 text-rose-700',
+              media: 'bg-amber-100 text-amber-700',
+              baja: 'bg-slate-100 text-slate-700'
+            }[task.priority] || 'bg-slate-100 text-slate-700';
+
+            return `
+    <div class="p-3.5 bg-white rounded-xl border border-slate-200/80 shadow-sm hover:shadow transition-all relative group">
+        <!-- Botones para editar y eliminar tarea -->
+<div class="absolute top-2 right-2 flex items-center gap-1">
+
+    <button
+        onclick="window.visariApp.openEditTeamTaskModal('${task.id}')"
+        class="text-violet-500 hover:text-violet-700 text-xs font-semibold px-1.5 py-0.5 rounded"
+        title="Editar tarea">
+        ✎
+    </button>
+
+    <button
+        onclick="window.visariApp.deleteTeamTask('${task.id}')"
+        class="text-slate-400 hover:text-red-500 text-xs font-bold px-1.5 py-0.5 rounded transition-colors"
+        title="Eliminar tarea">
+        &times;
+    </button>
+
+</div>
+
+        <div class="flex items-center justify-between gap-2 mb-2 pr-4">
+            <span class="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${priorityCls}">
+                ${task.priority}
+            </span>
+        </div>
+        
+        <h4 class="text-xs font-bold text-slate-800 leading-snug mb-2 pr-4">${task.title}</h4>
+        <div class="mb-3">
+  <label class="block text-[10px] font-semibold text-slate-500 mb-1">
+    Estado de la tarea
+  </label>
+
+  <select
+    class="w-full rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs font-medium"
+    onchange="window.visariApp.moveTeamTask('${task.id}', this.value)"
+    aria-label="Cambiar estado de la tarea"
+  >
+    <option value="todo" ${task.status === 'todo' ? 'selected' : ''}>
+      Por hacer
+    </option>
+
+    <option value="in_progress" ${task.status === 'in_progress' ? 'selected' : ''}>
+      En curso
+    </option>
+
+    <option value="done" ${task.status === 'done' ? 'selected' : ''}>
+      Completado
+    </option>
+  </select>
+</div>
+        <!-- El resto de tus elementos de la tarjeta... -->
+                <div class="flex items-center justify-between pt-1 border-t border-slate-100">
+                  <div class="flex items-center gap-1.5">
+                    <img src="${member.avatar}" class="w-5 h-5 rounded-full object-cover" />
+                    <span class="text-[11px] text-slate-600 font-medium truncate max-w-[90px]">${member.name}</span>
+                  </div>
+                  <span class="text-[10px] text-slate-400 font-medium">📅 ${task.dueDate}</span>
                             </div>
                         </div>
                     `;
-      }).join('');
-  });
-}
-openNewTeamTaskModal() {
-  const modal = document.getElementById('modal-new-team-task');
-  const selectMember = document.getElementById('team-task-assignee');
-  if (selectMember) {
-    selectMember.innerHTML = this.store.state.team.members.map(m => `
-        <option value="${m.id}">${m.name}</option>
-      `).join('');
+          }).join('');
+      });
+      if (typeof this.renderGroupProjectModule === "function") {
+        this.renderGroupProjectModule(this.store.state);
+      }
+      const forumSubjectId = subjectSelect.value;
+
+      if (
+        forumSubjectId &&
+        typeof this.renderSubjectForum === "function"
+      ) {
+        this.renderSubjectForum(forumSubjectId);
+      }
+    }
   }
-  if (modal) modal.classList.remove('hidden');
-}
 
-closeNewTeamTaskModal() {
-  const modal = document.getElementById('modal-new-team-task');
-  if (modal) modal.classList.add('hidden');
-}
-} // <--- Esta llave cierra la clase VisariApp
+  // ==========================================
+  // MÓDULO COLABORATIVO Y SOLICITUDES POR MATERIA
+  // ==========================================
 
-// Initialize on DOM ready
+  renderGroupProjectModule(state = this.store.state) {
+    const container = document.getElementById('group-project-container');
+    if (!container) return;
+
+    const currentUser = auth.currentUser;
+
+    const allSubjects = Array.isArray(this.store.state.subjects)
+      ? this.store.state.subjects
+      : [];
+
+    const subjects = allSubjects.filter(subject => {
+      // Si la materia tiene propietario registrado, debe coincidir
+      // con la cuenta que inició sesión.
+      if (subject.ownerUid) {
+        return subject.ownerUid === currentUser?.uid;
+      }
+
+      // Compatibilidad con materias antiguas que todavía no tienen UID.
+      // Se conservan porque pertenecen al estado local de esta cuenta.
+      return true;
+    });
+    // Mantener la materia seleccionada mientras se actualiza la vista.
+    const selectedSubjectId = subjects.some(
+      subject => subject.id === this.selectedInviteSubjectId
+    )
+      ? this.selectedInviteSubjectId
+      : (subjects[0]?.id || '');
+
+    this.selectedInviteSubjectId = selectedSubjectId;
+
+    container.innerHTML = `
+      <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+        <div class="mb-4">
+          <h3 class="text-base font-bold text-slate-900 mb-1">
+            Invitar integrante al equipo
+          </h3>
+          <p class="text-sm text-slate-500">
+            Seleccioná una materia e ingresá el correo de tu compañero.
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label for="study-request-subject"
+              class="block text-xs font-semibold text-slate-700 mb-2">
+              Materia
+            </label>
+
+            <select
+              id="study-request-subject"
+              onchange="window.visariApp.selectedInviteSubjectId = this.value"
+              class="w-full px-4 py-2.5 border border-slate-300 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-violet-500"
+              ${subjects.length === 0 ? 'disabled' : ''}
+            >
+              ${subjects.length
+        ? subjects.map(subject => `
+                      <option
+                        value="${subject.id}"
+                        ${subject.id === selectedSubjectId ? 'selected' : ''}
+                      >${subject.name}</option>
+                    `).join('')
+        : '<option value="">Primero agregá una materia</option>'
+      }
+            </select>
+          </div>
+
+          <div>
+            <label for="partner-email-input"
+              class="block text-xs font-semibold text-slate-700 mb-2">
+              Correo del compañero
+            </label>
+
+            <input
+              type="email"
+              id="partner-email-input"
+              placeholder="correo@universidad.edu"
+              class="w-full px-4 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
+              ${subjects.length === 0 ? 'disabled' : ''}
+            />
+          </div>
+        </div>
+
+        <div class="mt-4 flex justify-end">
+          <button
+            type="button"
+            onclick="window.visariApp.sendStudyRequest()"
+            class="px-5 py-2.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm rounded-xl transition"
+            ${subjects.length === 0 ? 'disabled' : ''}
+          >
+            Enviar invitación
+          </button>
+        </div>
+            </div>
+
+      <!-- INVITACIONES RECIBIDAS -->
+      <div class="mt-6 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+        <div class="mb-4">
+          <h3 class="text-base font-bold text-slate-900 mb-1">
+            Invitaciones recibidas
+          </h3>
+          <p class="text-sm text-slate-500">
+            Solicitudes de compañeros que quieren trabajar con vos.
+          </p>
+        </div>
+
+        <div id="incoming-study-requests" class="space-y-3">
+          <p class="text-sm text-slate-400">
+            Cargando invitaciones...
+          </p>
+        </div>
+      </div>
+    `;
+
+    this.renderIncomingStudyRequests();
+  }
+  async renderIncomingStudyRequests() {
+    const container = document.getElementById('incoming-study-requests');
+
+    if (!container) return;
+
+    const requests = await this.loadIncomingStudyRequests();
+
+    if (!document.getElementById('incoming-study-requests')) return;
+
+    if (requests.length === 0) {
+      container.innerHTML = `
+            <p class="text-sm text-slate-400">
+                No tenés invitaciones pendientes.
+            </p>
+        `;
+      return;
+    }
+
+    container.innerHTML = requests.map(request => `
+        <div class="p-4 border border-slate-200 rounded-xl flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div>
+                <p class="text-sm font-bold text-slate-800">
+                    ${request.fromUser || 'Un compañero'}
+                </p>
+                <p class="text-xs text-slate-500 mt-1">
+                    Te invitó a colaborar en una materia.
+                </p>
+            </div>
+
+            <div class="flex gap-2">
+                <button
+                    onclick="window.visariApp.respondToStudyRequest('${request.id}', 'accepted')"
+                    class="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold rounded-lg"
+                >
+                    Aceptar
+                </button>
+
+                <button
+                    onclick="window.visariApp.respondToStudyRequest('${request.id}', 'rejected')"
+                    class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg"
+                >
+                    Rechazar
+                </button>
+            </div>
+        </div>
+    `).join('');
+  }
+  async respondToStudyRequest(requestId, response) {
+    const currentUser = auth.currentUser;
+
+    if (!currentUser?.uid || !currentUser?.email) {
+      alert("Tenés que iniciar sesión para responder una invitación.");
+      return;
+    }
+
+    if (!["accepted", "rejected"].includes(response)) {
+      return;
+    }
+
+    try {
+      const requestRef = doc(db, "study_requests", requestId);
+      const requestSnapshot = await getDoc(requestRef);
+
+      if (!requestSnapshot.exists()) {
+        alert("Esta invitación ya no existe.");
+        return;
+      }
+
+      const requestData = requestSnapshot.data();
+
+      if (
+        requestData.toUserEmail?.toLowerCase() !==
+        currentUser.email.toLowerCase()
+      ) {
+        alert("No tenés permiso para responder esta invitación.");
+        return;
+      }
+
+      if (requestData.status !== "pending") {
+        alert("Esta invitación ya fue respondida.");
+        await this.renderIncomingStudyRequests();
+        return;
+      }
+
+      // Si acepta, registramos su incorporación al equipo.
+      if (response === "accepted") {
+
+        if (!requestData.fromUid) {
+          alert("Esta invitación no tiene registrado el propietario. Es necesario enviar una nueva invitación.");
+          return;
+        }
+
+        const memberId = `${requestData.subjectId}_${currentUser.uid}`;
+
+        const memberRef = doc(db, "subject_members", memberId);
+
+        await setDoc(memberRef, {
+          subjectId: requestData.subjectId,
+          subjectName: requestData.subjectName || "Materia sin nombre",
+          ownerUid: requestData.fromUid,
+          memberUid: currentUser.uid,
+          memberEmail: currentUser.email.toLowerCase(),
+          role: "member",
+          joinedAt: new Date().toISOString()
+        }, { merge: true });
+      }
+
+      // Actualizamos el estado de la invitación.
+      await updateDoc(requestRef, {
+        status: response,
+        acceptedByUid: response === "accepted" ? currentUser.uid : null,
+        acceptedByEmail: currentUser.email.toLowerCase(),
+        respondedAt: new Date().toISOString()
+      });
+
+      if (response === "accepted") {
+        alert("¡Aceptaste la invitación! Ahora formás parte del equipo.");
+      } else {
+        alert("Rechazaste la invitación.");
+      }
+
+      await this.renderIncomingStudyRequests();
+
+    } catch (error) {
+      console.error("Error al responder la invitación:", error);
+      alert("No se pudo procesar la invitación. Revisá la consola y los permisos de Firestore.");
+    }
+  }
+  async sendStudyRequest(subjectId) {
+    const input = document.getElementById('partner-email-input');
+    const subjectSelect = document.getElementById('study-request-subject');
+
+    const targetEmail = input ? input.value.trim() : '';
+    const selectedSubjectId =
+      subjectId ||
+      (subjectSelect ? subjectSelect.value : '') ||
+      this.selectedInviteSubjectId ||
+      '';
+    const selectedSubject = this.store.state.subjects.find(
+      subject => String(subject.id) === String(selectedSubjectId)
+    );
+
+    const selectedSubjectName = selectedSubject?.name || 'Materia sin nombre';
+    if (!selectedSubjectId) {
+      alert("Seleccioná una materia antes de enviar la invitación.");
+      return;
+    }
+
+    if (!targetEmail) {
+      alert("Por favor, ingresá el correo electrónico de tu compañero.");
+      return;
+    }
+
+    // Validación básica del correo.
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailPattern.test(targetEmail)) {
+      alert("Ingresá una dirección de correo electrónico válida.");
+      return;
+    }
+
+    const currentUserEmail =
+      this.store.state.user?.email ||
+      auth.currentUser?.email ||
+      '';
+
+    if (
+      currentUserEmail &&
+      currentUserEmail.toLowerCase() === targetEmail.toLowerCase()
+    ) {
+      alert("No podés enviarte una invitación a tu propio correo.");
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, "study_requests"), {
+        fromUser: currentUserEmail || "usuario_actual",
+        fromUid: auth.currentUser?.uid || null,
+        toUserEmail: targetEmail.toLowerCase(),
+        subjectId: selectedSubjectId,
+        subjectName: selectedSubjectName,
+        status: "pending",
+        createdAt: new Date().toISOString()
+      });
+
+      alert(`¡Solicitud enviada a ${targetEmail} con éxito!`);
+
+      if (input) {
+        input.value = '';
+      }
+    } catch (error) {
+      console.error("Error al enviar la solicitud:", error);
+      alert(
+        "Ocurrió un error al enviar la solicitud. Verificá la conexión y los permisos de Firestore."
+      );
+    }
+  }
+  async loadIncomingStudyRequests() {
+    const currentUser = auth.currentUser;
+
+    if (!currentUser?.email) return [];
+
+    try {
+      const q = query(
+        collection(db, "study_requests"),
+        where("toUserEmail", "==", currentUser.email.toLowerCase()),
+        where("status", "==", "pending")
+      );
+
+      const snapshot = await getDocs(q);
+
+      return snapshot.docs.map(document => ({
+        id: document.id,
+        ...document.data()
+      }));
+
+    } catch (error) {
+      console.error("Error cargando invitaciones recibidas:", error);
+      return [];
+    }
+  }
+  async loadTeamMembersFromFirebase(subjectId) {
+    const currentUser = auth.currentUser;
+
+    if (!currentUser?.uid || !subjectId) return;
+
+    try {
+      // Identificar al propietario del equipo.
+      let ownerUid = currentUser.uid;
+
+      const membershipQuery = query(
+        collection(db, "subject_members"),
+        where("subjectId", "==", String(subjectId)),
+        where("memberUid", "==", currentUser.uid)
+      );
+
+      const membershipSnapshot = await getDocs(membershipQuery);
+
+      if (!membershipSnapshot.empty) {
+        ownerUid = membershipSnapshot.docs[0].data().ownerUid;
+      }
+
+      // Buscar todos los integrantes de ese propietario y materia.
+      const q = query(
+        collection(db, "subject_members"),
+        where("subjectId", "==", String(subjectId)),
+        where("ownerUid", "==", ownerUid)
+      );
+
+      const querySnapshot = await getDocs(q);
+
+      // Incorporar al propietario.
+      const members = [{
+        id: ownerUid,
+        name: ownerUid === currentUser.uid
+          ? (currentUser.displayName || currentUser.email.split("@")[0])
+          : "Propietario",
+        email: ownerUid === currentUser.uid ? currentUser.email : "",
+        role: "owner"
+      }];
+
+      // Incorporar a los compañeros que aceptaron.
+      querySnapshot.forEach(document => {
+        const data = document.data();
+
+        members.push({
+          id: data.memberUid,
+          name: data.memberEmail
+            ? data.memberEmail.split("@")[0]
+            : "Compañero",
+          email: data.memberEmail || "",
+          role: data.role || "member"
+        });
+      });
+
+      // Evitar integrantes duplicados.
+      const uniqueMembers = [
+        ...new Map(members.map(member => [member.id, member])).values()
+      ];
+
+      this.state.team_members = uniqueMembers;
+
+      if (this.state.team) {
+        this.state.team.members = uniqueMembers;
+      }
+
+      if (this.store?.state?.team) {
+        this.store.state.team.members = uniqueMembers;
+      }
+
+      console.log("Integrantes cargados:", uniqueMembers);
+
+    } catch (error) {
+      console.error("Error cargando integrantes desde Firebase:", error);
+    }
+  }
+  openNewTeamTaskModal() {
+    const modal = document.getElementById('modal-new-team-task');
+    const selectMember = document.getElementById('team-task-assignee');
+    const subjectSelect = document.getElementById('team-subject-select');
+    const boardSelect = document.getElementById('team-board-subject-select');
+
+    const subjects = Array.isArray(this.store?.state?.subjects)
+      ? this.store.state.subjects
+      : [];
+
+    // Obtener la materia seleccionada en el tablero Kanban
+    const boardSubjectId = boardSelect?.value || this.selectedTeamTaskSubjectId || '';
+
+    if (subjectSelect) {
+      subjectSelect.innerHTML = subjects.map(subject => `
+        <option value="${subject.id}">
+          ${subject.name}${subject.isShared ? ' (Compartida)' : ''}
+        </option>
+      `).join('');
+
+      // Sincronizar el formulario con el tablero
+      if (subjects.some(subject => String(subject.id) === String(boardSubjectId))) {
+        subjectSelect.value = boardSubjectId;
+      }
+    }
+
+    const subjectId = subjectSelect?.value || '';
+
+    if (!subjectId) {
+      alert("No hay materias disponibles. Primero seleccioná una materia en el Kanban.");
+      return;
+    }
+
+    this.selectedTeamTaskSubjectId = subjectId;
+
+    console.log("📚 Materia seleccionada para la tarea:", subjectId);
+
+    if (selectMember) {
+      const members = Array.isArray(this.store?.state?.team_members)
+        ? this.store.state.team_members
+        : [];
+
+      selectMember.innerHTML = members.length > 0
+        ? members.map(m => `
+            <option value="${m.id}">${m.name}</option>
+          `).join('')
+        : `<option value="me">Yo</option>`;
+    }
+
+    if (modal) {
+      modal.classList.remove('hidden');
+    } else {
+      console.error("No se encontró el modal de tareas grupales.");
+    }
+  }
+  async handleNewTeamTaskSubmit(event) {
+    event.preventDefault();
+
+    const title = document.getElementById('team-task-title')?.value.trim();
+    const subjectId =
+      this.selectedTeamTaskSubjectId ||
+      document.getElementById('team-subject-select')?.value;
+    const assigneeId = document.getElementById('team-task-assignee')?.value;
+    const priority = document.getElementById('team-task-priority')?.value;
+    const dueDate = document.getElementById('team-task-date')?.value;
+
+    if (!title) {
+      this.store.showToast("Ingresá el nombre de la tarea.");
+      return;
+    }
+
+    if (!subjectId) {
+      this.store.showToast("Seleccioná una materia.");
+      return;
+    }
+
+    try {
+      const saved = await this.store.addTeamTask({
+        title,
+        subjectId,
+        assigneeId,
+        priority,
+        dueDate,
+        status: "todo"
+      });
+
+      // Si el guardado falla, dejamos el modal abierto.
+      if (saved !== true) return;
+
+      await this.loadTeamTasks(subjectId);
+      this.renderTeam(this.store.state);
+
+      this.closeNewTeamTaskModal();
+
+    } catch (error) {
+      console.error("Error al asignar tarea al tablero:", error);
+      this.store.showToast("No se pudo asignar la tarea.");
+    }
+  }
+  async loadTeamTasks(subjectId) {
+    console.log("📚 Materia seleccionada:", subjectId);
+
+    try {
+      const currentUser = auth.currentUser;
+
+      if (!currentUser) {
+        console.error("❌ No hay un usuario autenticado.");
+        return;
+      }
+
+      if (!subjectId) {
+        console.warn("⚠️ No se seleccionó ninguna materia.");
+        return;
+      }
+
+      // Identificar quién es el propietario del equipo.
+      let ownerUid = currentUser.uid;
+
+      // Si soy un invitado, buscar quién es el propietario.
+      const membershipQuery = query(
+        collection(db, "subject_members"),
+        where("subjectId", "==", String(subjectId)),
+        where("memberUid", "==", currentUser.uid)
+      );
+
+      const membershipSnapshot = await getDocs(membershipQuery);
+
+      if (!membershipSnapshot.empty) {
+        ownerUid = membershipSnapshot.docs[0].data().ownerUid;
+      }
+
+      console.log("👤 Propietario del equipo:", ownerUid);
+
+      // Buscar las tareas del propietario.
+      const tasksQuery = query(
+        collection(db, "team_tasks"),
+        where("ownerUid", "==", ownerUid),
+        where("subjectId", "==", String(subjectId))
+      );
+
+      const snapshot = await getDocs(tasksQuery);
+
+      console.log("📦 Documentos encontrados:", snapshot.size);
+
+      // Trabajar con el estado de VisariStore.
+      const store = this.store;
+
+      if (!store || !store.state) {
+        throw new Error("No se encontró el estado de VisariStore.");
+      }
+
+      // Asegurar que exista el espacio para las tareas del equipo.
+      if (!store.state.team) {
+        store.state.team = { tasks: [] };
+      }
+
+      if (!Array.isArray(store.state.team.tasks)) {
+        store.state.team.tasks = [];
+      }
+
+      // Cargar las tareas recuperadas desde Firestore.
+      store.state.team.tasks = snapshot.docs.map(taskDoc => ({
+        ...taskDoc.data(),
+        id: taskDoc.id
+      }));
+
+      console.log(
+        "📋 Tareas cargadas en el estado:",
+        store.state.team.tasks
+      );
+
+      // Guardar el estado local actualizado.
+      store.saveState();
+
+    } catch (error) {
+      console.error("❌ Error al cargar tareas de Firestore:", error);
+      console.error("Código:", error.code);
+      console.error("Mensaje:", error.message);
+    }
+  }
+  closeNewTeamTaskModal() {
+    const modal = document.getElementById('modal-new-team-task');
+    if (modal) modal.classList.add('hidden');
+  }
+  async deleteTeamTask(taskId) {
+    console.log("🗑️ Eliminando tarea:", taskId);
+
+    if (
+      taskId === undefined ||
+      taskId === null ||
+      String(taskId).trim() === ""
+    ) {
+      console.error("ID de tarea inválido.");
+      return;
+    }
+
+    if (!confirm("¿Estás seguro de querer eliminar esta tarea?")) {
+      return;
+    }
+
+    try {
+      const currentUser = auth.currentUser;
+
+      if (!currentUser) {
+        this.store.showToast("Iniciá sesión para eliminar la tarea.");
+        return;
+      }
+
+      const taskRef = doc(db, "team_tasks", String(taskId));
+      const taskSnap = await getDoc(taskRef);
+
+      if (!taskSnap.exists()) {
+        this.store.showToast("La tarea ya no existe.");
+        return;
+      }
+
+      const taskData = taskSnap.data();
+
+      let authorized = taskData.ownerUid === currentUser.uid;
+
+      if (!authorized) {
+        const membershipQuery = query(
+          collection(db, "subject_members"),
+          where("subjectId", "==", String(taskData.subjectId)),
+          where("ownerUid", "==", taskData.ownerUid),
+          where("memberUid", "==", currentUser.uid)
+        );
+
+        const membershipSnapshot = await getDocs(membershipQuery);
+        authorized = !membershipSnapshot.empty;
+      }
+
+      if (!authorized) {
+        this.store.showToast("No tenés permiso para eliminar esta tarea.");
+        return;
+      }
+
+      await deleteDoc(taskRef);
+
+      console.log("✅ Tarea eliminada de Firestore:", taskId);
+
+      const tasks = this.store.state.team.tasks || [];
+
+      this.store.state.team.tasks = tasks.filter(
+        task => String(task.id) !== String(taskId)
+      );
+
+      this.store.saveState();
+      this.renderTeam(this.store.state);
+
+      console.log("✅ Tablero Kanban actualizado.");
+
+    } catch (error) {
+      console.error("❌ Error al eliminar la tarea:", error);
+      alert("No se pudo eliminar la tarea. Revisá la consola para ver el error.");
+    }
+  }
+
+} // <--- Esta es la llave que cierra la clase VisariApp
+
+// Inicializar VISARi cuando el documento esté listo
 document.addEventListener('DOMContentLoaded', () => {
   window.visariApp = new VisariApp();
+  window.app = window.visariApp;
+  console.log('VISARi inicializada correctamente', window.visariApp);
 });
