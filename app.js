@@ -11,7 +11,8 @@ import {
   where,
   orderBy,
   deleteDoc,
-  updateDoc
+  updateDoc,
+  onSnapshot
 } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
 import {
   getAuth,
@@ -683,47 +684,53 @@ class VisariApp {
 
       const membershipSnapshot = await getDocs(membershipQuery);
 
-      const localSubjects = this.store.state.subjects || [];
+      const ownSubjects = this.store.state.subjects || [];
+      const sharedSubjects = [];
 
       for (const membershipDoc of membershipSnapshot.docs) {
         const membership = membershipDoc.data();
 
-        const subjectRef = doc(
-          db,
-          "subjects",
-          String(membership.subjectId)
-        );
+        const subjectId = String(membership.subjectId);
 
-        const subjectSnap = await getDoc(subjectRef);
-
-        if (!subjectSnap.exists()) {
-          console.warn(
-            "No se encontró la materia compartida:",
-            membership.subjectId
-          );
+        // Si ya es una materia propia con el mismo ID,
+        // no necesitamos agregarla nuevamente.
+        if (ownSubjects.some(subject =>
+          String(subject.id) === subjectId
+        )) {
           continue;
         }
 
-        const sharedSubject = {
-          ...subjectSnap.data(),
-          id: String(membership.subjectId),
+        const subjectRef = doc(db, "subjects", subjectId);
+        const subjectSnap = await getDoc(subjectRef);
+
+        if (!subjectSnap.exists()) {
+          console.warn("No se encontró la materia:", subjectId);
+          continue;
+        }
+
+        const firebaseSubject = subjectSnap.data();
+
+        sharedSubjects.push({
+          id: subjectId,
+          code: firebaseSubject.code || '',
+          name: firebaseSubject.name || 'Materia compartida',
+          color: firebaseSubject.color || 'from-violet-600 to-indigo-600',
+          accent: firebaseSubject.accent || '#8b5cf6',
+          professor: firebaseSubject.professor || '',
+          credits: firebaseSubject.credits || 0,
+          targetGrade: firebaseSubject.targetGrade || 8,
           isShared: true,
           sharedOwnerUid: membership.ownerUid
-        };
-
-        const alreadyExists = localSubjects.some(
-          subject => String(subject.id) === String(sharedSubject.id)
-        );
-
-        if (!alreadyExists) {
-          localSubjects.push(sharedSubject);
-        }
+        });
       }
 
-      this.store.state.subjects = localSubjects;
+      // Guardar las materias compartidas por separado.
+      this.store.state.sharedSubjects = sharedSubjects;
+
       this.store.saveState();
 
-      console.log("Materias compartidas cargadas:", localSubjects);
+      console.log("Materias propias:", ownSubjects);
+      console.log("Materias compartidas:", sharedSubjects);
 
     } catch (error) {
       console.error("Error cargando materias compartidas:", error);
@@ -1955,6 +1962,462 @@ class VisariApp {
         }).join('');
       }
     }
+
+    // Mostrar el foro de la materia seleccionada.
+    this.renderSubjectForum(subject.id);
+  }
+
+  renderSubjectForum(subjectId) {
+    const container = document.getElementById('subject-forum-container');
+    const currentUser = auth.currentUser;
+
+    if (!container || !subjectId || !currentUser) return;
+
+    // Cerrar las escuchas anteriores.
+    if (this.subjectForumUnsubscribe) {
+      this.subjectForumUnsubscribe();
+      this.subjectForumUnsubscribe = null;
+    }
+
+    if (this.subjectForumCommentsUnsubscribe) {
+      this.subjectForumCommentsUnsubscribe();
+      this.subjectForumCommentsUnsubscribe = null;
+    }
+
+    container.innerHTML = `
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 mt-6">
+        <h3 class="text-lg font-bold text-slate-900">Foro de la materia</h3>
+        <p class="text-sm text-slate-500 mb-5">
+          Creá temas de debate y conversá con tus compañeros.
+        </p>
+
+        <form id="subject-forum-form" class="mb-6">
+          <input
+            id="subject-forum-title"
+            required
+            maxlength="120"
+            placeholder="Título del tema (ej.: Unidad 1)"
+            class="w-full border border-slate-200 rounded-xl p-3 text-sm mb-3"
+          />
+
+          <textarea
+            id="subject-forum-content"
+            required
+            rows="3"
+            placeholder="Escribí la consigna o planteá el tema de debate..."
+            class="w-full border border-slate-200 rounded-xl p-3 text-sm"
+          ></textarea>
+
+          <div class="flex justify-end mt-3">
+            <button
+              type="submit"
+              class="bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold px-5 py-2.5 rounded-xl"
+            >
+              Crear tema
+            </button>
+          </div>
+        </form>
+
+        <div id="subject-forum-posts" class="space-y-5">
+          <p class="text-sm text-slate-400 text-center py-5">
+            Cargando temas...
+          </p>
+        </div>
+      </div>
+    `;
+
+    const postsContainer = document.getElementById('subject-forum-posts');
+    const form = document.getElementById('subject-forum-form');
+
+    let ownerUid = currentUser.uid;
+    let postsData = [];
+    let commentsData = [];
+
+    const getAuthorName = () =>
+      currentUser.displayName ||
+      (currentUser.email ? currentUser.email.split("@")[0] : "Usuario");
+
+    // Crear un tema nuevo.
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      const title = document.getElementById('subject-forum-title').value.trim();
+      const content = document.getElementById('subject-forum-content').value.trim();
+
+      if (!title || !content) return;
+
+      const button = form.querySelector('button[type="submit"]');
+      button.disabled = true;
+      button.textContent = "Publicando...";
+
+      try {
+        await addDoc(collection(db, "forum_posts"), {
+          subjectId: String(subjectId),
+          ownerUid: ownerUid,
+          authorUid: currentUser.uid,
+          authorName: getAuthorName(),
+          authorEmail: currentUser.email || "",
+          title: title,
+          content: content,
+          createdAt: new Date().toISOString()
+        });
+
+        form.reset();
+
+      } catch (error) {
+        console.error("Error creando tema:", error);
+        alert("No se pudo crear el tema.");
+      } finally {
+        button.disabled = false;
+        button.textContent = "Crear tema";
+      }
+    });
+
+    // Crear un comentario o una respuesta.
+    postsContainer.addEventListener('submit', async (event) => {
+      const commentForm = event.target.closest('.forum-comment-form');
+      if (!commentForm) return;
+
+      event.preventDefault();
+
+      const textarea = commentForm.querySelector('textarea');
+      const content = textarea.value.trim();
+
+      if (!content) return;
+
+      const postId = commentForm.dataset.postId;
+      const parentCommentId = commentForm.dataset.parentId || null;
+      const button = commentForm.querySelector('button[type="submit"]');
+
+      button.disabled = true;
+
+      try {
+        await addDoc(collection(db, "forum_comments"), {
+          subjectId: String(subjectId),
+          ownerUid: ownerUid,
+          postId: postId,
+          parentCommentId: parentCommentId,
+          authorUid: currentUser.uid,
+          authorName: getAuthorName(),
+          content: content,
+          createdAt: new Date().toISOString()
+        });
+
+        textarea.value = "";
+
+      } catch (error) {
+        console.error("Error publicando comentario:", error);
+        alert("No se pudo publicar el comentario.");
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    // Controlar respuestas y eliminación de comentarios.
+    postsContainer.addEventListener('click', async (event) => {
+      const replyButton = event.target.closest('.forum-reply-button');
+
+      if (replyButton) {
+        const form = replyButton.nextElementSibling;
+
+        if (form && form.classList.contains('forum-comment-form')) {
+          form.classList.toggle('hidden');
+
+          if (!form.classList.contains('hidden')) {
+            form.querySelector('textarea').focus();
+          }
+        }
+
+        return;
+      }
+
+      const deleteButton = event.target.closest('.forum-delete-comment');
+      if (!deleteButton) return;
+
+      const commentId = deleteButton.dataset.commentId;
+      const comment = commentsData.find(item => item.id === commentId);
+
+      if (!comment || comment.authorUid !== currentUser.uid) {
+        alert("Solamente podés eliminar tus propios comentarios.");
+        return;
+      }
+
+      if (!confirm("¿Querés eliminar este comentario y todas sus respuestas?")) {
+        return;
+      }
+
+      try {
+        // Reunir el comentario y todas sus respuestas.
+        const idsToDelete = new Set([commentId]);
+        let foundNew = true;
+
+        while (foundNew) {
+          foundNew = false;
+
+          commentsData.forEach(item => {
+            if (
+              item.parentCommentId &&
+              idsToDelete.has(item.parentCommentId) &&
+              !idsToDelete.has(item.id)
+            ) {
+              idsToDelete.add(item.id);
+              foundNew = true;
+            }
+          });
+        }
+
+        // Eliminar todos los documentos de Firebase.
+        for (const id of idsToDelete) {
+          await deleteDoc(doc(db, "forum_comments", id));
+        }
+
+      } catch (error) {
+        console.error("Error eliminando comentario:", error);
+        alert("No se pudo eliminar el comentario.");
+      }
+    });
+    // Construir un formulario de comentario o respuesta.
+    const createCommentForm = (postId, parentId = "") => {
+      const commentForm = document.createElement('form');
+      commentForm.className = "forum-comment-form hidden mt-3 space-y-2";
+      commentForm.dataset.postId = postId;
+      commentForm.dataset.parentId = parentId;
+
+      const textarea = document.createElement('textarea');
+      textarea.required = true;
+      textarea.rows = 2;
+      textarea.maxLength = 2000;
+      textarea.placeholder = "Escribí tu comentario...";
+      textarea.className = "w-full border border-slate-200 rounded-lg p-2.5 text-sm";
+
+      const button = document.createElement('button');
+      button.type = "submit";
+      button.textContent = "Enviar";
+      button.className = "bg-violet-600 text-white text-xs font-semibold px-4 py-2 rounded-lg";
+
+      commentForm.append(textarea, button);
+
+      return commentForm;
+    };
+
+    // Construir cada comentario y sus respuestas.
+    const buildComment = (comment, postId, allComments) => {
+      const wrapper = document.createElement('div');
+
+      wrapper.className = "bg-white border border-slate-200 rounded-xl p-3 mt-3 shadow-sm";
+
+      const header = document.createElement('div');
+      header.className = "flex items-center justify-between gap-2";
+
+      const author = document.createElement('p');
+      author.className = "text-sm font-bold text-slate-800";
+      author.textContent = comment.authorName || "Usuario";
+
+      const date = document.createElement('p');
+      date.className = "text-xs text-slate-400";
+      date.textContent = comment.createdAt
+        ? new Date(comment.createdAt).toLocaleString('es-AR')
+        : "";
+
+      header.append(author, date);
+
+      const content = document.createElement('p');
+      content.className = "text-sm text-slate-700 whitespace-pre-wrap mt-3";
+      content.textContent = comment.content || "";
+
+      const actions = document.createElement('div');
+      actions.className = "flex items-center gap-4 mt-3";
+
+      const replyButton = document.createElement('button');
+      replyButton.type = "button";
+      replyButton.textContent = "↳ Responder";
+      replyButton.className = "forum-reply-button text-xs font-semibold text-violet-600";
+
+      actions.appendChild(replyButton);
+
+      // Mostrar eliminar solamente al autor.
+      if (comment.authorUid === currentUser.uid) {
+        const deleteButton = document.createElement('button');
+        deleteButton.type = "button";
+        deleteButton.textContent = "Eliminar";
+        deleteButton.className = "forum-delete-comment text-xs font-semibold text-rose-600";
+        deleteButton.dataset.commentId = comment.id;
+
+        actions.appendChild(deleteButton);
+      }
+
+      wrapper.append(header, content, actions);
+      wrapper.appendChild(createCommentForm(postId, comment.id));
+
+      // Mostrar respuestas dentro del comentario correspondiente.
+      const replies = allComments
+        .filter(item => item.parentCommentId === comment.id)
+        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+      if (replies.length > 0) {
+        const repliesContainer = document.createElement('div');
+        repliesContainer.className = "ml-4 mt-3 pl-3 border-l-2 border-violet-200";
+
+        replies.forEach(reply => {
+          repliesContainer.appendChild(
+            buildComment(reply, postId, allComments)
+          );
+        });
+
+        wrapper.appendChild(repliesContainer);
+      }
+
+      return wrapper;
+    };
+    // Dibujar los temas y sus conversaciones.
+
+    // Dibujar los temas y sus conversaciones.
+    const renderForum = () => {
+      postsContainer.innerHTML = "";
+
+      if (postsData.length === 0) {
+        postsContainer.textContent = "Todavía no hay temas de debate.";
+        return;
+      }
+
+      postsData.forEach(post => {
+        const card = document.createElement('article');
+        card.className = "bg-slate-200 border border-slate-300 rounded-xl p-4 shadow-sm";
+        const title = document.createElement('h4');
+        title.className = "text-base font-bold text-slate-900";
+        title.textContent = post.title || "Tema de debate";
+
+        const author = document.createElement('p');
+        author.className = "text-xs text-slate-500 mt-1";
+        author.textContent = `${post.authorName || "Usuario"} · ${post.createdAt ? new Date(post.createdAt).toLocaleString('es-AR') : ""
+          }`;
+
+        const content = document.createElement('p');
+        content.className = "text-sm text-slate-700 whitespace-pre-wrap mt-3";
+        content.textContent = post.content || "";
+
+        // Obtener todos los comentarios del tema.
+        const postComments = commentsData.filter(
+          comment => comment.postId === post.id
+        );
+
+        const rootComments = postComments
+          .filter(comment => !comment.parentCommentId)
+          .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+        // Crear la sección desplegable de la conversación.
+        const conversation = document.createElement('details');
+        conversation.className = "mt-5 border-t border-slate-200 pt-3";
+
+        const summary = document.createElement('summary');
+        summary.className = "cursor-pointer text-sm font-bold text-violet-700 py-2";
+
+        const count = postComments.length;
+        summary.textContent = `Ver conversación (${count} ${count === 1 ? "intervención" : "intervenciones"
+          })`;
+
+        const conversationBody = document.createElement('div');
+        conversationBody.className = "pt-2";
+
+        if (rootComments.length === 0) {
+          const empty = document.createElement('p');
+          empty.className = "text-xs text-slate-400 mt-2";
+          empty.textContent = "Todavía no hay comentarios. ¡Iniciá la conversación!";
+          conversationBody.appendChild(empty);
+        }
+
+        // Mostrar comentarios y todas sus respuestas.
+        rootComments.forEach(comment => {
+          conversationBody.appendChild(
+            buildComment(comment, post.id, postComments)
+          );
+        });
+
+        // Permitir agregar un comentario al tema.
+        const commentButton = document.createElement('button');
+        commentButton.type = "button";
+        commentButton.textContent = "Escribir un comentario";
+        commentButton.className = "forum-reply-button text-sm font-semibold text-violet-600 mt-4";
+
+        conversationBody.appendChild(commentButton);
+        conversationBody.appendChild(createCommentForm(post.id));
+
+        conversation.append(summary, conversationBody);
+        card.append(title, author, content, conversation);
+        postsContainer.appendChild(card);
+      });
+    };
+
+
+    // Resolver el propietario de la materia compartida.
+    const loadForum = async () => {
+      const membershipQuery = query(
+        collection(db, "subject_members"),
+        where("subjectId", "==", String(subjectId)),
+        where("memberUid", "==", currentUser.uid)
+      );
+
+      const membershipSnapshot = await getDocs(membershipQuery);
+
+      if (!membershipSnapshot.empty) {
+        ownerUid = membershipSnapshot.docs[0].data().ownerUid;
+      }
+
+      // Escuchar los temas en tiempo real.
+      const postsQuery = query(
+        collection(db, "forum_posts"),
+        where("subjectId", "==", String(subjectId)),
+        where("ownerUid", "==", ownerUid)
+      );
+
+      this.subjectForumUnsubscribe = onSnapshot(
+        postsQuery,
+        snapshot => {
+          postsData = snapshot.docs.map(document => ({
+            id: document.id,
+            ...document.data()
+          }));
+
+          postsData.sort((a, b) =>
+            new Date(b.createdAt) - new Date(a.createdAt)
+          );
+
+          renderForum();
+        },
+        error => {
+          console.error("Error escuchando temas:", error);
+        }
+      );
+
+      // Escuchar todos los comentarios y respuestas.
+      const commentsQuery = query(
+        collection(db, "forum_comments"),
+        where("subjectId", "==", String(subjectId)),
+        where("ownerUid", "==", ownerUid)
+      );
+
+      this.subjectForumCommentsUnsubscribe = onSnapshot(
+        commentsQuery,
+        snapshot => {
+          commentsData = snapshot.docs.map(document => ({
+            id: document.id,
+            ...document.data()
+          }));
+
+          renderForum();
+        },
+        error => {
+          console.error("Error escuchando comentarios:", error);
+        }
+      );
+    };
+
+    loadForum().catch(error => {
+      console.error("Error iniciando el foro:", error);
+      postsContainer.textContent = "No se pudo conectar con el foro.";
+    });
+
+    console.log("Foro de debates conectado:", subjectId);
   }
 
   openNewSubjectModal() {
@@ -2363,43 +2826,60 @@ class VisariApp {
     console.log("SELECTOR ENCONTRADO:", subjectSelect);
     console.log("ID DEL SELECTOR:", subjectSelect?.id);
     console.log("CANTIDAD DE OPCIONES:", subjectSelect?.options.length);
-    const subjects = (Array.isArray(state.subjects) ? state.subjects : [])
-      .filter(subject => {
-        const currentUid = auth.currentUser?.uid;
+    const allSubjects = [
+      ...(Array.isArray(state.subjects) ? state.subjects : []),
+      ...(Array.isArray(state.sharedSubjects) ? state.sharedSubjects : [])
+    ].filter(subject => {
+      const currentUid = auth.currentUser?.uid;
 
-        // Materias propias.
-        if (subject.ownerUid === currentUid) {
-          return true;
-        }
+      if (subject.isShared === true) {
+        return true;
+      }
 
-        // Materias compartidas por otro usuario.
-        if (
-          subject.isShared === true &&
-          subject.sharedOwnerUid
-        ) {
-          return true;
-        }
+      if (subject.ownerUid === currentUid) {
+        return true;
+      }
 
-        // Materias antiguas sin propietario registrado.
-        if (!subject.ownerUid) {
-          return true;
-        }
+      if (!subject.ownerUid) {
+        return true;
+      }
 
-        return false;
-      });
-    console.log("📚 Materias en el estado:", state.subjects);
+      return false;
+    });
+
+    // Evitar materias duplicadas por nombre.
+    // Si existe una compartida, tendrá prioridad en el Kanban.
+    const subjectsByName = new Map();
+
+    allSubjects.forEach(subject => {
+      const normalizedName = (subject.name || '').trim().toLowerCase();
+
+      if (!subjectsByName.has(normalizedName)) {
+        subjectsByName.set(normalizedName, subject);
+        return;
+      }
+
+      const existing = subjectsByName.get(normalizedName);
+
+      if (subject.isShared && !existing.isShared) {
+        subjectsByName.set(normalizedName, subject);
+      }
+    });
+
+    const subjects = Array.from(subjectsByName.values());
+    console.log("📚 Materias propias:", state.subjects);
+    console.log("📚 Materias compartidas:", state.sharedSubjects);
     console.log("📚 Materias que muestra el tablero:", subjects);
     if (subjectSelect) {
       const previousValue = subjectSelect.value;
 
       subjectSelect.innerHTML = subjects.length
         ? subjects.map(subject => `
-        <option value="${subject.id}">
-          ${subject.name}
-        </option>
-      `).join("")
+  <option value="${subject.id}">
+    ${subject.name}${subject.isShared ? ' (Compartida)' : ''}
+  </option>
+`).join("")
         : '<option value="">Primero agregá una materia</option>';
-
       const selectedSubject = subjects.some(
         subject => String(subject.id) === String(previousValue)
       )
@@ -2700,9 +3180,12 @@ class VisariApp {
                 <p class="text-sm font-bold text-slate-800">
                     ${request.fromUser || 'Un compañero'}
                 </p>
-                <p class="text-xs text-slate-500 mt-1">
-                    Te invitó a colaborar en una materia.
-                </p>
+               <p class="text-xs text-slate-500 mt-1">
+    Te invita a colaborar en:
+    <strong class="text-violet-700">
+        ${request.subjectName || 'Materia sin nombre'}
+    </strong>
+</p>
             </div>
 
             <div class="flex gap-2">
@@ -2790,6 +3273,12 @@ class VisariApp {
         acceptedByEmail: currentUser.email.toLowerCase(),
         respondedAt: new Date().toISOString()
       });
+
+      // Actualizar las materias compartidas después de aceptar.
+      if (response === "accepted") {
+        await this.loadSharedSubjectsFromFirebase(currentUser.uid);
+        this.renderTeam(this.store.state);
+      }
 
       if (response === "accepted") {
         alert("¡Aceptaste la invitación! Ahora formás parte del equipo.");
@@ -2977,9 +3466,15 @@ class VisariApp {
     const subjectSelect = document.getElementById('team-subject-select');
     const boardSelect = document.getElementById('team-board-subject-select');
 
-    const subjects = Array.isArray(this.store?.state?.subjects)
-      ? this.store.state.subjects
-      : [];
+    const subjects = [
+      ...(Array.isArray(this.store?.state?.subjects)
+        ? this.store.state.subjects
+        : []),
+
+      ...(Array.isArray(this.store?.state?.sharedSubjects)
+        ? this.store.state.sharedSubjects
+        : [])
+    ];
 
     // Obtener la materia seleccionada en el tablero Kanban
     const boardSubjectId = boardSelect?.value || this.selectedTeamTaskSubjectId || '';
