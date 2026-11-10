@@ -588,6 +588,7 @@ class VisariApp {
   constructor() {
     this.store = window.appStore;
     this.currentView = 'landing'; // Starts on landing until onAuthStateChanged validates session
+    this.authInitialized = false;
     this.authMode = 'login'; // 'login' | 'register'
     this.selectedSubjectDetail = null;
     this.currentCalendarDate = new Date();
@@ -630,12 +631,26 @@ class VisariApp {
   // ==========================================
   setupFirebaseAuth() {
     onAuthStateChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
-        console.log("Firebase Auth State Changed: User Active", firebaseUser.email);
-        await this.handleUserAuthenticated(firebaseUser);
-      } else {
-        console.log("Firebase Auth State Changed: No User Active");
-        this.handleUserSignedOut();
+      try {
+        if (firebaseUser) {
+          console.log(
+            "Firebase Auth State Changed: User Active",
+            firebaseUser.email
+          );
+
+          await this.handleUserAuthenticated(firebaseUser);
+
+        } else {
+          console.log("Firebase Auth State Changed: No User Active");
+          this.handleUserSignedOut();
+        }
+
+      } catch (error) {
+        console.error("Error al verificar la sesión de Firebase:", error);
+
+      } finally {
+        this.authInitialized = true;
+        this.render();
       }
     });
   }
@@ -794,7 +809,47 @@ class VisariApp {
     this.store.saveState();
 
     if (this.currentView === "landing") {
-      this.currentView = "dashboard";
+      const savedView = localStorage.getItem(
+        `visari_last_view_${firebaseUser.uid}`
+      );
+
+      const validViews = [
+        'dashboard',
+        'materias',
+        'materia-detail',
+        'timer',
+        'calendar',
+        'team',
+        'profile'
+      ];
+
+      let restoredView = 'dashboard';
+
+      if (savedView) {
+        try {
+          const saved = JSON.parse(savedView);
+
+          if (validViews.includes(saved.view)) {
+            restoredView = saved.view;
+
+            if (saved.view === 'materia-detail') {
+              const subjectExists = this.store.state.subjects.some(
+                subject => String(subject.id) === String(saved.subjectId)
+              );
+
+              if (subjectExists) {
+                this.selectedSubjectDetail = saved.subjectId;
+              } else {
+                restoredView = 'materias';
+              }
+            }
+          }
+        } catch (error) {
+          console.warn("No se pudo recuperar la última sección.");
+        }
+      }
+
+      this.currentView = restoredView;
     }
 
     this.render();
@@ -1008,8 +1063,22 @@ class VisariApp {
       return;
     }
     this.currentView = view;
+
     if (view === 'materia-detail' && payload) {
       this.selectedSubjectDetail = payload;
+    }
+
+    // Guardar la última sección visitada para esta cuenta.
+    const uid = auth.currentUser?.uid;
+
+    if (uid && view !== 'landing') {
+      localStorage.setItem(
+        `visari_last_view_${uid}`,
+        JSON.stringify({
+          view: view,
+          subjectId: view === 'materia-detail' ? payload : null
+        })
+      );
     }
 
     this.render();
@@ -1022,7 +1091,36 @@ class VisariApp {
     // Check auth view vs app view
     const landingView = document.getElementById('view-landing');
     const appShell = document.getElementById('app-shell');
+    // Esperar a que Firebase confirme el estado de autenticación.
+    const loadingView = document.getElementById('visari-auth-loading');
 
+    if (!this.authInitialized) {
+      if (landingView) landingView.classList.add('hidden');
+      if (appShell) appShell.classList.add('hidden');
+
+      if (!loadingView) {
+        const loader = document.createElement('div');
+
+        loader.id = 'visari-auth-loading';
+        loader.className = 'fixed inset-0 z-[9999] flex flex-col items-center justify-center bg-slate-950 text-white';
+
+        loader.innerHTML = `
+      <div class="h-10 w-10 rounded-full border-4 border-violet-400/30 border-t-violet-400 animate-spin"></div>
+      <p class="mt-4 text-sm font-medium text-slate-200">
+        Verificando tu sesión...
+      </p>
+    `;
+
+        document.body.appendChild(loader);
+      }
+
+      return;
+    }
+
+    // Quitar la pantalla de carga cuando Firebase termina.
+    if (loadingView) {
+      loadingView.remove();
+    }
     if (this.currentView === 'landing' || !state.user.isAuthenticated) {
       if (landingView) landingView.classList.remove('hidden');
       if (appShell) appShell.classList.add('hidden');
@@ -1661,13 +1759,13 @@ class VisariApp {
       });
     }
 
-    // Definir nota base (si hay notas usa el promedio, si no, usa el avance de tareas, o un 6.5 inicial)
-    let baseAverage = 6.5;
+    // Calcular promedio general según las notas reales.
+    let baseAverage = 0;
+
     if (scoredCount > 0) {
       baseAverage = totalScore / scoredCount;
     } else if (currentSubjects.length > 0) {
       baseAverage = totalProgressScore / currentSubjects.length;
-      if (baseAverage < 5.0) baseAverage = 6.5;
     }
 
     // 3. Calcular horas de estudio totales acumuladas o de la semana
@@ -1920,7 +2018,17 @@ class VisariApp {
       if (subject.tasks.length === 0) {
         tasksContainer.innerHTML = `<p class="text-sm text-slate-400 py-6 text-center">No hay actividades creadas para esta materia aún.</p>`;
       } else {
-        tasksContainer.innerHTML = subject.tasks.map(task => {
+        // Ordenar: pendientes primero y completadas al final.
+        // Dentro de cada grupo, ordenar por fecha límite.
+        const sortedTasks = [...subject.tasks].sort((a, b) => {
+          if (Boolean(a.completed) === Boolean(b.completed)) {
+            return new Date(a.dueDate) - new Date(b.dueDate);
+          }
+
+          return a.completed ? 1 : -1;
+        });
+
+        tasksContainer.innerHTML = sortedTasks.map(task => {
           const typeLabels = {
             tarea: { text: "Tarea", cls: "bg-blue-50 text-blue-700 border-blue-200" },
             entrega: { text: "Entrega TP", cls: "bg-purple-50 text-purple-700 border-purple-200" },
@@ -2118,7 +2226,7 @@ class VisariApp {
       const replyButton = event.target.closest('.forum-reply-button');
 
       if (replyButton) {
-        const form = replyButton.nextElementSibling;
+        const form = replyButton.parentElement.nextElementSibling;
 
         if (form && form.classList.contains('forum-comment-form')) {
           form.classList.toggle('hidden');
@@ -2273,6 +2381,12 @@ class VisariApp {
 
     // Dibujar los temas y sus conversaciones.
     const renderForum = () => {
+      // Recordar qué conversaciones estaban abiertas.
+      const openPostIds = new Set(
+        Array.from(postsContainer.querySelectorAll('details[open]'))
+          .map(conversation => conversation.dataset.postId)
+      );
+
       postsContainer.innerHTML = "";
 
       if (postsData.length === 0) {
@@ -2308,7 +2422,8 @@ class VisariApp {
         // Crear la sección desplegable de la conversación.
         const conversation = document.createElement('details');
         conversation.className = "mt-5 border-t border-slate-200 pt-3";
-
+        conversation.dataset.postId = post.id;
+        conversation.open = openPostIds.has(post.id);
         const summary = document.createElement('summary');
         summary.className = "cursor-pointer text-sm font-bold text-violet-700 py-2";
 
