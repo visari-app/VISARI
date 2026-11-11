@@ -1062,12 +1062,14 @@ class VisariApp {
           materia: data.name || "(sin nombre)",
           id: String(data.id || subjectDoc.id),
           tareas: Array.isArray(data.tasks) ? data.tasks.length : 0,
-          minutos: Number(data.studyMinutes || 0)
+          minutos: Number(data.studyMinutes || 0),
+          actividades: (data.tasks || [])
+            .map(t => t.title || t.name || "(sin título)")
+            .join(" | ")
         });
       });
 
       console.table(registros);
-
       console.log("Total de registros en Firebase:", registros.length);
 
     } catch (error) {
