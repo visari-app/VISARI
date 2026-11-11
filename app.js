@@ -1001,6 +1001,54 @@ class VisariApp {
       console.error("Error sincronizando materias:", error);
     }
   }
+  async uploadLocalSubjectsToFirebase(uid) {
+    if (!uid) return;
+
+    const subjects = this.store?.state?.subjects || [];
+    let actualizadas = 0;
+
+    try {
+      for (const subject of subjects) {
+        if (!subject?.id) continue;
+
+        if (subject.ownerUid && subject.ownerUid !== uid) {
+          continue;
+        }
+
+        const subjectRef = doc(db, "subjects", String(subject.id));
+        const subjectSnap = await getDoc(subjectRef);
+
+        if (!subjectSnap.exists()) {
+          console.warn("Materia no encontrada:", subject.name);
+          continue;
+        }
+
+        const firebaseSubject = subjectSnap.data();
+
+        if (firebaseSubject.ownerUid !== uid) {
+          console.warn("Materia de otro usuario:", subject.name);
+          continue;
+        }
+
+        await updateDoc(subjectRef, {
+          tasks: Array.isArray(subject.tasks) ? subject.tasks : [],
+          studyMinutes: subject.studyMinutes || 0
+        });
+
+        actualizadas++;
+
+        console.log("Actualizada:", subject.name);
+      }
+
+      console.log(
+        "Total de materias actualizadas desde la notebook:",
+        actualizadas
+      );
+
+    } catch (error) {
+      console.error("Error subiendo materias:", error);
+    }
+  }
   async loadSharedSubjectsFromFirebase(uid) {
     if (!uid) return;
 
