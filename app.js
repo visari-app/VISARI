@@ -1076,6 +1076,37 @@ class VisariApp {
       console.error("Error consultando materias:", error);
     }
   }
+  async cleanDuplicateSubjectsFromFirebase() {
+    const conservar = new Set([
+      "sub-1794390990041",
+      "sub-1792974315969",
+      "sub-1792975782451",
+      "sub-1792975797455",
+      "sub-1792754708200",
+      "sub-1792754660849"
+    ]);
+
+    try {
+      const snapshot = await getDocs(collection(db, "subjects"));
+
+      const eliminar = snapshot.docs.filter(
+        d => !conservar.has(d.id)
+      );
+
+      console.table(eliminar.map(d => ({
+        id: d.id,
+        materia: d.data().name || "(sin nombre)"
+      })));
+
+      console.log(
+        "Documentos identificados para eliminar:",
+        eliminar.length
+      );
+
+    } catch (error) {
+      console.error("Error preparando limpieza:", error);
+    }
+  }
   async loadSharedSubjectsFromFirebase(uid) {
     if (!uid) return;
 
