@@ -440,6 +440,7 @@ class VisariStore {
 
     this.showToast("Actividad actualizada correctamente");
   }
+
   addStudyTime(subjectId, minutes) {
     const subject = this.state.subjects.find(s => s.id === subjectId);
     if (!subject) return;
@@ -453,18 +454,79 @@ class VisariStore {
     }
 
     // Registrar la sesión individual
-    this.state.studySessions.push({
+    const newSession = {
       id: Date.now().toString(),
       subjectId: subjectId,
       subject: subject.name,
       durationMinutes: minutes,
       date: new Date().toISOString()
-    });
+    };
+
+    this.state.studySessions.push(newSession);
+
+    // Guardar la sesión en Firebase para sincronizarla entre dispositivos
+    const uid = this.state.user?.uid || this.state.user?.ownerUid;
+
+    if (uid) {
+      setDoc(
+        doc(db, "study_sessions", `${uid}_${newSession.id}`),
+        {
+          ...newSession,
+          ownerUid: uid
+        }
+      ).catch(error => {
+        console.error("Error sincronizando sesión de estudio:", error);
+      });
+    }
 
     this.saveState();
 
     this.showToast(`⏱️ Se registraron +${minutes} minutos de estudio en ${subject.name}`);
   }
+
+  async syncStudySessionsWithFirebase(uid) {
+    if (!uid) return;
+
+    try {
+      const sessionsQuery = query(
+        collection(db, "study_sessions"),
+        where("ownerUid", "==", uid)
+      );
+
+      const snapshot = await getDocs(sessionsQuery);
+
+      const localSessions = this.state.studySessions || [];
+
+      // Unificar las sesiones locales y las descargadas de Firebase.
+      const sessionsMap = new Map();
+
+      localSessions.forEach(session => {
+        sessionsMap.set(String(session.id), session);
+      });
+
+      snapshot.forEach(sessionDoc => {
+        const session = sessionDoc.data();
+
+        sessionsMap.set(String(session.id), {
+          ...session,
+          id: String(session.id)
+        });
+      });
+
+      this.state.studySessions = Array.from(sessionsMap.values());
+
+      this.saveState();
+
+      console.log(
+        "Sesiones de estudio sincronizadas:",
+        this.state.studySessions.length
+      );
+
+    } catch (error) {
+      console.error("Error recuperando sesiones de estudio:", error);
+    }
+  }
+
   // --- Team Actions ---
 
   async addTeamTask(taskData) {
@@ -1009,6 +1071,9 @@ class VisariApp {
     await this.loadMySubjectsFromFirebase(firebaseUser.uid);
     await this.syncMySubjectsToFirebase(firebaseUser.uid);
     await this.loadSharedSubjectsFromFirebase(firebaseUser.uid);
+
+    // Recuperar el historial de estudio desde Firebase.
+    await this.store.syncStudySessionsWithFirebase(firebaseUser.uid);
     const userDocRef = doc(db, "users", firebaseUser.uid);
 
     // Perfil vacío para una cuenta que todavía no guardó sus datos.
