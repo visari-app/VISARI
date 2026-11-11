@@ -304,7 +304,48 @@ class VisariStore {
     this.saveState();
     this.showToast("Materia eliminada");
   }
+  async syncSubjectTasksToFirebase(subject) {
+    const currentUser = auth.currentUser;
 
+    if (!currentUser?.uid || !subject?.id) return;
+
+    // Sincronizar únicamente materias propias.
+    if (!subject.ownerUid || subject.ownerUid !== currentUser.uid) {
+      return;
+    }
+
+    try {
+      const subjectRef = doc(db, "subjects", String(subject.id));
+      const subjectSnap = await getDoc(subjectRef);
+
+      // No crear ni reemplazar documentos inexistentes.
+      if (!subjectSnap.exists()) {
+        console.warn("No se encontró la materia en Firebase:", subject.id);
+        return;
+      }
+
+      const firebaseSubject = subjectSnap.data();
+
+      // Verificar que el documento pertenezca al usuario actual.
+      if (firebaseSubject.ownerUid !== currentUser.uid) {
+        console.warn("No se sincronizó: la materia pertenece a otro usuario.");
+        return;
+      }
+
+      // Actualizar exclusivamente las actividades.
+      await updateDoc(subjectRef, {
+        tasks: Array.isArray(subject.tasks) ? subject.tasks : []
+      });
+
+      console.log("Actividades sincronizadas correctamente:", subject.name);
+
+    } catch (error) {
+      console.error("Error sincronizando actividades:", error);
+      this.showToast(
+        "La actividad quedó guardada localmente, pero no se pudo sincronizar con Firebase."
+      );
+    }
+  }
   toggleTask(subjectId, taskId) {
     const subject = this.state.subjects.find(s => s.id === subjectId);
     if (!subject) return;
@@ -323,20 +364,28 @@ class VisariStore {
     }
 
     this.saveState();
+    this.syncSubjectTasksToFirebase(subject);
   }
 
   addTask(subjectId, taskData) {
-    const subject = this.state.subjects.find(s => s.id === subjectId);
-    if (!subject) return;
+    const subject = this.state.subjects.find(
+      s => String(s.id) === String(subjectId)
+    );
+
+    if (!subject) {
+      this.showToast("No se encontró la materia seleccionada.");
+      return;
+    }
 
     const newTask = {
       id: 't-' + Date.now(),
-      subjectId: subjectId,
+      subjectId: subject.id,
       title: taskData.title || 'Nueva actividad',
       type: taskData.type || 'tarea',
       dueDate: taskData.dueDate || new Date().toISOString().split('T')[0],
       createdAt: new Date().toISOString(),
       weight: Number(taskData.weight) || 10,
+      reminderTime: taskData.reminderTime || '',
       completed: false,
       grade: null
     };
@@ -344,16 +393,53 @@ class VisariStore {
     subject.tasks.push(newTask);
 
     this.saveState();
+    this.syncSubjectTasksToFirebase(subject);
+
     this.showToast("Actividad agregada a " + subject.name);
   }
   deleteTask(subjectId, taskId) {
     const subject = this.state.subjects.find(s => s.id === subjectId);
     if (!subject) return;
     subject.tasks = subject.tasks.filter(t => t.id !== taskId);
+
     this.saveState();
+    this.syncSubjectTasksToFirebase(subject);
+
     this.showToast("Actividad eliminada");
   }
+  updateTask(subjectId, taskId, taskData) {
+    const subject = this.state.subjects.find(
+      s => String(s.id) === String(subjectId)
+    );
 
+    if (!subject) {
+      this.showToast("No se encontró la materia.");
+      return;
+    }
+
+    const task = (subject.tasks || []).find(
+      t => String(t.id) === String(taskId)
+    );
+
+    if (!task) {
+      this.showToast("No se encontró la actividad.");
+      return;
+    }
+
+    task.title = taskData.title || task.title;
+    task.type = taskData.type || task.type;
+    task.dueDate = taskData.dueDate || task.dueDate;
+    task.weight = Number(taskData.weight) || task.weight;
+
+    if (taskData.reminderTime !== undefined) {
+      task.reminderTime = taskData.reminderTime;
+    }
+
+    this.saveState();
+    this.syncSubjectTasksToFirebase(subject);
+
+    this.showToast("Actividad actualizada correctamente");
+  }
   addStudyTime(subjectId, minutes) {
     const subject = this.state.subjects.find(s => s.id === subjectId);
     if (!subject) return;
@@ -605,9 +691,124 @@ class VisariApp {
 
     this.setupGlobalEvents();
     this.setupFirebaseAuth();
+
+    this.setupReminderNotifications();
+
     this.render();
   }
+  setupReminderNotifications() {
+    if (this.reminderTicker) {
+      clearInterval(this.reminderTicker);
+    }
 
+    if (!this.reminderNotified) {
+      try {
+        this.reminderNotified = new Set(
+          JSON.parse(sessionStorage.getItem('visari-dismissed-reminders') || '[]')
+        );
+      } catch (error) {
+        this.reminderNotified = new Set();
+      }
+    }
+
+    const checkReminders = () => {
+      const now = new Date();
+
+      const today = [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, '0'),
+        String(now.getDate()).padStart(2, '0')
+      ].join('-');
+
+      const currentTime = [
+        String(now.getHours()).padStart(2, '0'),
+        String(now.getMinutes()).padStart(2, '0')
+      ].join(':');
+
+      const subjects = this.store.state.subjects || [];
+
+      for (const subject of subjects) {
+        for (const task of (subject.tasks || [])) {
+          if (
+            task.completed ||
+            task.dueDate !== today ||
+            !task.reminderTime ||
+            task.reminderTime > currentTime
+          ) {
+            continue;
+          }
+
+          const reminderId = `${subject.id}_${task.id}`;
+
+          if (this.reminderNotified.has(reminderId)) continue;
+
+          this.reminderNotified.add(reminderId);
+
+          this.showTaskReminder(subject, task);
+          return;
+        }
+      }
+    };
+
+    checkReminders();
+
+    this.reminderTicker = setInterval(checkReminders, 15000);
+  }
+  showTaskReminder(subject, task) {
+    const existing = document.getElementById('visari-task-reminder');
+    if (existing) existing.remove();
+
+    const reminder = document.createElement('div');
+    reminder.id = 'visari-task-reminder';
+
+    reminder.className = 'fixed bottom-5 right-5 z-[100] w-full max-w-sm bg-white border border-violet-200 rounded-2xl shadow-2xl p-4';
+
+    reminder.innerHTML = `
+      <div class="flex items-start gap-3">
+        <div class="w-10 h-10 rounded-xl bg-violet-100 flex items-center justify-center text-xl">
+          🔔
+        </div>
+
+        <div class="flex-1 min-w-0">
+          <p class="text-sm font-bold text-slate-900">Recordatorio de actividad</p>
+          <p class="text-xs font-semibold text-violet-700 mt-1">${task.title}</p>
+          <p class="text-[11px] text-slate-500 mt-1">${subject.name} • ${task.reminderTime}</p>
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-2 mt-4">
+        <button id="visari-reminder-close"
+          class="px-3 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg">
+          Cerrar
+        </button>
+
+        <button id="visari-reminder-done"
+          class="px-3 py-2 text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 rounded-lg">
+          Marcar como realizado
+        </button>
+      </div>
+    `;
+
+    document.body.appendChild(reminder);
+
+    document.getElementById('visari-reminder-close').onclick = () => {
+      const reminderId = `${subject.id}_${task.id}`;
+
+      this.reminderNotified.add(reminderId);
+
+      sessionStorage.setItem(
+        'visari-dismissed-reminders',
+        JSON.stringify([...this.reminderNotified])
+      );
+
+      reminder.remove();
+    };
+
+    document.getElementById('visari-reminder-done').onclick = () => {
+      this.store.toggleTask(subject.id, task.id);
+      reminder.remove();
+    };
+  }
   setupGlobalEvents() {
     // Top Bar Botón V quick-trigger
     const topBarBtnB = document.getElementById('topbar-btn-b');
@@ -2035,13 +2236,13 @@ class VisariApp {
             foro: { text: "Foro / Debate", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
             lectura: { text: "📖 Lectura Diaria", cls: "bg-teal-50 text-teal-800 border-teal-300 font-bold" },
             reunion: {
-  text: "Reunión",
-  cls: "bg-indigo-50 text-indigo-700 border-indigo-200"
-},
-clase_sincronica: {
-  text: "Clase Sincrónica",
-  cls: "bg-cyan-50 text-cyan-700 border-cyan-200"
-},
+              text: "Reunión",
+              cls: "bg-indigo-50 text-indigo-700 border-indigo-200"
+            },
+            clase_sincronica: {
+              text: "Clase Sincrónica",
+              cls: "bg-cyan-50 text-cyan-700 border-cyan-200"
+            },
             parcial: { text: "Examen Parcial", cls: "bg-amber-50 text-amber-700 border-amber-200" },
             final: { text: "Examen Final", cls: "bg-rose-50 text-rose-700 border-rose-200" }
           };
@@ -2553,14 +2754,59 @@ clase_sincronica: {
     if (modal) modal.classList.add('hidden');
   }
 
-  openNewTaskModal() {
+  openNewTaskModal(date = null) {
     const modal = document.getElementById('modal-new-task');
-    if (modal) modal.classList.remove('hidden');
+    if (!modal) return;
+
+    const dateInput = document.getElementById('new-task-date');
+
+    if (dateInput) {
+      const today = new Date();
+      const localDate = [
+        today.getFullYear(),
+        String(today.getMonth() + 1).padStart(2, '0'),
+        String(today.getDate()).padStart(2, '0')
+      ].join('-');
+
+      dateInput.value = date || localDate;
+    }
+
+    this.editingTaskId = null;
+    this.editingTaskSubjectId = null;
+
+    // Cargar las materias en el selector.
+    const subjectSelect = document.getElementById('new-task-subject');
+
+    if (subjectSelect) {
+      const subjects = this.store.state.subjects || [];
+
+      subjectSelect.innerHTML = '<option value="">Seleccionar materia</option>';
+
+      subjects.forEach(subject => {
+        const option = document.createElement('option');
+        option.value = subject.id;
+        option.textContent = subject.name;
+        subjectSelect.appendChild(option);
+      });
+
+      const selectedId = this.selectedSubjectDetail || '';
+
+      if (subjects.some(s => String(s.id) === String(selectedId))) {
+        subjectSelect.value = selectedId;
+      } else if (subjects.length === 1) {
+        subjectSelect.value = subjects[0].id;
+      }
+    }
+
+    modal.classList.remove('hidden');
   }
 
   closeNewTaskModal() {
     const modal = document.getElementById('modal-new-task');
     if (modal) modal.classList.add('hidden');
+
+    this.editingTaskId = null;
+    this.editingTaskSubjectId = null;
   }
 
   confirmDeleteSubject(subjectId) {
@@ -2721,6 +2967,7 @@ clase_sincronica: {
       (sub.tasks || []).forEach(task => {
         allEvents.push({
           ...task,
+          subjectId: sub.id,
           subjectName: sub.name,
           subjectCode: sub.code,
           subjectColor: sub.accent || '#8B5CF6'
@@ -2785,7 +3032,10 @@ clase_sincronica: {
         </div>
       `;
 
-      cell.onclick = () => this.showCalendarDayEvents(dateStr, dayEvents);
+      cell.onclick = () => {
+        this.showCalendarDayEvents(dateStr, dayEvents);
+        this.openNewTaskModal(dateStr);
+      };
       gridEl.appendChild(cell);
     }
 
@@ -2823,19 +3073,72 @@ clase_sincronica: {
       detailContent.innerHTML = `<p class="text-xs text-slate-400 py-3">No hay actividades programadas para este día.</p>`;
     } else {
       detailContent.innerHTML = events.map(ev => `
-        <div class="p-2.5 bg-slate-50 rounded-lg border border-slate-200 flex items-center justify-between">
-          <div>
+               <div class="p-2.5 bg-slate-50 rounded-lg border border-slate-200 flex items-center justify-between gap-2">
+          <div class="min-w-0">
             <p class="text-xs font-bold text-slate-800">${ev.title}</p>
             <p class="text-[11px] text-slate-500">${ev.subjectName} (${ev.type})</p>
           </div>
-          <span class="text-xs font-semibold ${ev.completed ? 'text-emerald-600' : 'text-amber-600'}">
-            ${ev.completed ? '✓ Completado' : '⏳ Pendiente'}
-          </span>
+          <div class="flex items-center gap-2 shrink-0">
+            <span class="text-xs font-semibold ${ev.completed ? 'text-emerald-600' : 'text-amber-600'}">
+              ${ev.completed ? '✓ Completado' : '⏳ Pendiente'}
+            </span>
+            <button type="button"
+              onclick="window.visariApp.editCalendarTask('${ev.subjectId}', '${ev.id}')"
+              class="px-2 py-1 text-[10px] font-bold text-violet-700 bg-violet-100 hover:bg-violet-200 rounded-lg">
+              Editar
+            </button>
+          </div>
         </div>
       `).join('');
     }
   }
+  editCalendarTask(subjectId, taskId) {
+    const subject = this.store.state.subjects.find(
+      s => String(s.id) === String(subjectId)
+    );
 
+    if (!subject) {
+      this.store.showToast("No se encontró la materia.");
+      return;
+    }
+
+    const task = (subject.tasks || []).find(
+      t => String(t.id) === String(taskId)
+    );
+
+    if (!task) {
+      this.store.showToast("No se encontró la actividad.");
+      return;
+    }
+
+    this.editingTaskId = task.id;
+    this.editingTaskSubjectId = subject.id;
+    const subjectSelect = document.getElementById('new-task-subject');
+
+    if (subjectSelect) {
+      const subjects = this.store.state.subjects || [];
+
+      subjectSelect.innerHTML = '<option value="">Seleccionar materia</option>';
+
+      subjects.forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.id;
+        option.textContent = item.name;
+        subjectSelect.appendChild(option);
+      });
+
+      subjectSelect.value = subject.id;
+    }
+
+    document.getElementById('new-task-title').value = task.title || '';
+    document.getElementById('new-task-type').value = task.type || 'tarea';
+    document.getElementById('new-task-date').value = task.dueDate || '';
+    document.getElementById('new-task-weight').value = task.weight ?? 10;
+    document.getElementById('new-task-time').value = task.reminderTime || '';
+
+    const modal = document.getElementById('modal-new-task');
+    if (modal) modal.classList.remove('hidden');
+  }
   prevMonth() {
     this.currentCalendarDate.setMonth(this.currentCalendarDate.getMonth() - 1);
     this.render();
