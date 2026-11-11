@@ -855,6 +855,56 @@ class VisariApp {
       }
     });
   }
+  async loadMySubjectsFromFirebase(uid) {
+    if (!uid) return;
+
+    try {
+      const ownSubjectsQuery = query(
+        collection(db, "subjects"),
+        where("ownerUid", "==", uid)
+      );
+
+      const snapshot = await getDocs(ownSubjectsQuery);
+
+      const localSubjects = this.store.state.subjects || [];
+      const localIds = new Set(
+        localSubjects.map(subject => String(subject.id))
+      );
+
+      const firebaseSubjects = [];
+
+      snapshot.forEach(subjectDoc => {
+        const data = subjectDoc.data();
+        const subjectId = String(data.id || subjectDoc.id);
+
+        // No duplicar materias que ya existen localmente.
+        if (localIds.has(subjectId)) return;
+
+        firebaseSubjects.push({
+          ...data,
+          id: subjectId,
+          ownerUid: uid,
+          tasks: Array.isArray(data.tasks) ? data.tasks : []
+        });
+      });
+
+      // Conservar las materias locales y agregar las descargadas.
+      this.store.state.subjects = [
+        ...localSubjects,
+        ...firebaseSubjects
+      ];
+
+      this.store.saveState();
+
+      console.log(
+        "Materias propias recuperadas desde Firebase:",
+        firebaseSubjects.length
+      );
+
+    } catch (error) {
+      console.error("Error recuperando materias propias:", error);
+    }
+  }
   async syncMySubjectsToFirebase(uid) {
     if (!uid) return;
 
@@ -955,6 +1005,8 @@ class VisariApp {
   async handleUserAuthenticated(firebaseUser) {
     // Cargar el estado local correspondiente a este usuario.
     this.store.setUserData(firebaseUser);
+
+    await this.loadMySubjectsFromFirebase(firebaseUser.uid);
     await this.syncMySubjectsToFirebase(firebaseUser.uid);
     await this.loadSharedSubjectsFromFirebase(firebaseUser.uid);
     const userDocRef = doc(db, "users", firebaseUser.uid);
