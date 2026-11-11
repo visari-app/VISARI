@@ -1049,6 +1049,31 @@ class VisariApp {
       console.error("Error subiendo materias:", error);
     }
   }
+  async inspectSubjectsInFirebase() {
+    try {
+      const snapshot = await getDocs(collection(db, "subjects"));
+
+      const registros = [];
+
+      snapshot.forEach(subjectDoc => {
+        const data = subjectDoc.data();
+
+        registros.push({
+          materia: data.name || "(sin nombre)",
+          id: String(data.id || subjectDoc.id),
+          tareas: Array.isArray(data.tasks) ? data.tasks.length : 0,
+          minutos: Number(data.studyMinutes || 0)
+        });
+      });
+
+      console.table(registros);
+
+      console.log("Total de registros en Firebase:", registros.length);
+
+    } catch (error) {
+      console.error("Error consultando materias:", error);
+    }
+  }
   async loadSharedSubjectsFromFirebase(uid) {
     if (!uid) return;
 
