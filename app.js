@@ -2034,6 +2034,14 @@ class VisariApp {
             entrega: { text: "Entrega TP", cls: "bg-purple-50 text-purple-700 border-purple-200" },
             foro: { text: "Foro / Debate", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
             lectura: { text: "📖 Lectura Diaria", cls: "bg-teal-50 text-teal-800 border-teal-300 font-bold" },
+            reunion: {
+  text: "Reunión",
+  cls: "bg-indigo-50 text-indigo-700 border-indigo-200"
+},
+clase_sincronica: {
+  text: "Clase Sincrónica",
+  cls: "bg-cyan-50 text-cyan-700 border-cyan-200"
+},
             parcial: { text: "Examen Parcial", cls: "bg-amber-50 text-amber-700 border-amber-200" },
             final: { text: "Examen Final", cls: "bg-rose-50 text-rose-700 border-rose-200" }
           };
