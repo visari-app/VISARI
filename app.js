@@ -2206,7 +2206,7 @@ class VisariApp {
       +${studyBonus.toFixed(1)}
     </span>
     <span style="color: #16a34a; font-size: 0.45em; font-weight: 500; margin-left: 3px;">
-      Por tiempo de estudio
+      (Por tiempo de estudio)
     </span>
   `;
     }
