@@ -2181,29 +2181,27 @@ class VisariApp {
       baseAverage = totalProgressScore / currentSubjects.length;
     }
 
-    // 3. Calcular horas de estudio totales acumuladas o de la semana
+    // 3. Calcular horas históricas acumuladas desde las materias
     let totalMinutes = 0;
-    currentSessions.forEach(ses => {
-      totalMinutes += ses.durationMinutes || ses.minutes || 0;
+
+    currentSubjects.forEach(subject => {
+      totalMinutes += Number(subject.studyMinutes) || 0;
     });
-    // Si no hay sesiones en el array global, usa las de la semana calculadas antes
-    if (totalMinutes === 0 && typeof weeklyStudyMinutes !== 'undefined') {
-      totalMinutes = weeklyStudyMinutes;
-    }
 
     const studyHours = totalMinutes / 60;
 
-    // 4. Bonus por esfuerzo: Cada 1 hora de estudio suma +0.1 al promedio (tope de +2.5)
+    // 4. Bonus por esfuerzo
     const studyBonus = Math.min(2.5, studyHours * 0.1);
 
-    // 5. Promedio final combinado (tope máximo de 10.0)
+    // 5. Promedio final combinado
     let finalAverage = Math.min(10.0, baseAverage + studyBonus);
 
-    // Inyectar en el elemento HTML del GPA
+    // Mostrar promedio en pantalla
     const gpaElement = document.getElementById('dash-gpa');
     if (gpaElement) {
       gpaElement.textContent = `${finalAverage.toFixed(1)} / 10`;
     }
+
     this.renderDashboardSegments(state, metrics);
   }
 
