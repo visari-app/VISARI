@@ -12,7 +12,8 @@ import {
   orderBy,
   deleteDoc,
   updateDoc,
-  onSnapshot
+  onSnapshot,
+  increment
 } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
 import {
   getAuth,
@@ -146,7 +147,47 @@ class VisariStore {
     }
     this.notify();
   }
+  async syncStudySessionsWithFirebase(uid) {
+    if (!uid) return;
 
+    try {
+      const sessionsQuery = query(
+        collection(db, "study_sessions"),
+        where("ownerUid", "==", uid)
+      );
+
+      const snapshot = await getDocs(sessionsQuery);
+
+      const sessionsMap = new Map();
+
+      // Conservar las sesiones locales.
+      (this.state.studySessions || []).forEach(session => {
+        sessionsMap.set(String(session.id), session);
+      });
+
+      // Incorporar o actualizar las sesiones de Firebase.
+      snapshot.forEach(sessionDoc => {
+        const session = sessionDoc.data();
+
+        sessionsMap.set(String(session.id), {
+          ...session,
+          id: String(session.id)
+        });
+      });
+
+      this.state.studySessions = Array.from(sessionsMap.values());
+
+      this.saveState();
+
+      console.log(
+        "Sesiones de estudio sincronizadas:",
+        this.state.studySessions.length
+      );
+
+    } catch (error) {
+      console.error("Error recuperando sesiones de estudio:", error);
+    }
+  }
   resetToDemo() {
     const prevAuth = this.state.user && this.state.user.isAuthenticated;
     const prevUser = this.state.user;
@@ -441,90 +482,72 @@ class VisariStore {
     this.showToast("Actividad actualizada correctamente");
   }
 
-  addStudyTime(subjectId, minutes) {
+  async addStudyTime(subjectId, minutes) {
     const subject = this.state.subjects.find(s => s.id === subjectId);
     if (!subject) return;
 
-    // Mantener el acumulado histórico de la materia
-    subject.studyMinutes = (subject.studyMinutes || 0) + minutes;
+    const currentUser = auth.currentUser;
+    const uid = currentUser?.uid;
 
-    // Crear historial de sesiones si todavía no existe
+    if (!uid || subject.ownerUid !== uid) {
+      console.warn("No se pueden sincronizar minutos de una materia ajena.");
+      return;
+    }
+
+    const duration = Number(minutes);
+    if (!Number.isFinite(duration) || duration <= 0) return;
+
+    // Actualizar acumulado local.
+    subject.studyMinutes = (subject.studyMinutes || 0) + duration;
+
     if (!this.state.studySessions) {
       this.state.studySessions = [];
     }
 
-    // Registrar la sesión individual
+    // Registrar sesión individual.
     const newSession = {
-      id: Date.now().toString(),
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       subjectId: subjectId,
       subject: subject.name,
-      durationMinutes: minutes,
+      durationMinutes: duration,
       date: new Date().toISOString()
     };
 
     this.state.studySessions.push(newSession);
 
-    // Guardar la sesión en Firebase para sincronizarla entre dispositivos
-    const uid = this.state.user?.uid || this.state.user?.ownerUid;
+    this.saveState();
 
-    if (uid) {
-      setDoc(
+    try {
+      const subjectRef = doc(db, "subjects", String(subject.id));
+
+      // Incremento atómico: evita sobrescribir minutos
+      // registrados desde otro dispositivo.
+      await updateDoc(subjectRef, {
+        studyMinutes: increment(duration)
+      });
+
+      await setDoc(
         doc(db, "study_sessions", `${uid}_${newSession.id}`),
         {
           ...newSession,
           ownerUid: uid
         }
-      ).catch(error => {
-        console.error("Error sincronizando sesión de estudio:", error);
-      });
-    }
-
-    this.saveState();
-
-    this.showToast(`⏱️ Se registraron +${minutes} minutos de estudio en ${subject.name}`);
-  }
-
-  async syncStudySessionsWithFirebase(uid) {
-    if (!uid) return;
-
-    try {
-      const sessionsQuery = query(
-        collection(db, "study_sessions"),
-        where("ownerUid", "==", uid)
       );
 
-      const snapshot = await getDocs(sessionsQuery);
-
-      const localSessions = this.state.studySessions || [];
-
-      // Unificar las sesiones locales y las descargadas de Firebase.
-      const sessionsMap = new Map();
-
-      localSessions.forEach(session => {
-        sessionsMap.set(String(session.id), session);
-      });
-
-      snapshot.forEach(sessionDoc => {
-        const session = sessionDoc.data();
-
-        sessionsMap.set(String(session.id), {
-          ...session,
-          id: String(session.id)
-        });
-      });
-
-      this.state.studySessions = Array.from(sessionsMap.values());
-
-      this.saveState();
-
-      console.log(
-        "Sesiones de estudio sincronizadas:",
-        this.state.studySessions.length
-      );
+      console.log("Minutos y sesión sincronizados con Firebase.");
 
     } catch (error) {
-      console.error("Error recuperando sesiones de estudio:", error);
+      console.error("Error sincronizando tiempo de estudio:", error);
+
+      this.showToast(
+        "El tiempo quedó guardado localmente, pero no se pudo sincronizar con Firebase."
+      );
+      return;
     }
+
+    this.showToast(
+      `⏱️ Se registraron +${duration} minutos de estudio en ${subject.name}`
+    );
   }
 
   // --- Team Actions ---
@@ -928,77 +951,33 @@ class VisariApp {
 
       const snapshot = await getDocs(ownSubjectsQuery);
 
-      const localSubjects = this.store.state.subjects || [];
-      const localIds = new Set(
-        localSubjects.map(subject => String(subject.id))
-      );
-
       const firebaseSubjects = [];
 
       snapshot.forEach(subjectDoc => {
         const data = subjectDoc.data();
-        const subjectId = String(data.id || subjectDoc.id);
-
-        // No duplicar materias que ya existen localmente.
-        if (localIds.has(subjectId)) return;
 
         firebaseSubjects.push({
           ...data,
-          id: subjectId,
+          id: String(data.id || subjectDoc.id),
           ownerUid: uid,
-          tasks: Array.isArray(data.tasks) ? data.tasks : []
+          tasks: Array.isArray(data.tasks) ? data.tasks : [],
+          studyMinutes: Number(data.studyMinutes || 0)
         });
       });
 
-      // Conservar las materias locales y agregar las descargadas.
-      this.store.state.subjects = [
-        ...localSubjects,
-        ...firebaseSubjects
-      ];
+
+      // Firebase reemplaza la información local de las materias propias.
+      this.store.state.subjects = firebaseSubjects;
 
       this.store.saveState();
 
       console.log(
-        "Materias propias recuperadas desde Firebase:",
+        "Materias propias sincronizadas desde Firebase:",
         firebaseSubjects.length
       );
 
     } catch (error) {
-      console.error("Error recuperando materias propias:", error);
-    }
-  }
-  async syncMySubjectsToFirebase(uid) {
-    if (!uid) return;
-
-    const subjects = Array.isArray(this.store?.state?.subjects)
-      ? this.store.state.subjects
-      : [];
-
-    try {
-      for (const subject of subjects) {
-        if (!subject || !subject.id) continue;
-
-        // No migrar materias que pertenecen a otro usuario.
-        if (subject.ownerUid && subject.ownerUid !== uid) continue;
-
-        const subjectRef = doc(db, "subjects", String(subject.id));
-        const subjectSnap = await getDoc(subjectRef);
-
-        // Crear el documento solamente si todavía no existe.
-        if (!subjectSnap.exists()) {
-          await setDoc(subjectRef, {
-            ...subject,
-            id: String(subject.id),
-            ownerUid: uid,
-            createdAt: subject.createdAt || new Date().toISOString()
-          });
-        }
-      }
-
-      console.log("Materias propias sincronizadas con Firebase.");
-
-    } catch (error) {
-      console.error("Error sincronizando materias:", error);
+      console.error("Error recuperando materias:", error);
     }
   }
   async uploadLocalSubjectsToFirebase(uid) {
@@ -1175,7 +1154,6 @@ class VisariApp {
     this.store.setUserData(firebaseUser);
 
     await this.loadMySubjectsFromFirebase(firebaseUser.uid);
-    await this.syncMySubjectsToFirebase(firebaseUser.uid);
     await this.loadSharedSubjectsFromFirebase(firebaseUser.uid);
 
     // Recuperar el historial de estudio desde Firebase.
@@ -1232,7 +1210,18 @@ class VisariApp {
 
     this.store.saveState();
 
-    if (this.currentView === "landing") {
+    if (
+      this.currentView === "landing" ||
+      ![
+        'dashboard',
+        'materias',
+        'materia-detail',
+        'timer',
+        'calendar',
+        'team',
+        'profile'
+      ].includes(this.currentView)
+    ) {
       const savedView = localStorage.getItem(
         `visari_last_view_${firebaseUser.uid}`
       );
