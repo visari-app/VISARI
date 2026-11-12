@@ -3078,23 +3078,50 @@ class VisariApp {
 
   startTimer() {
     if (this.store.timer.isRunning) return;
+
     this.store.timer.isRunning = true;
 
+    // Registrar el momento exacto en que comienza
+    this.timerStartTimestamp = Date.now();
+    this.timerStartSeconds = this.store.timer.seconds || 0;
+
     this.timerTicker = setInterval(() => {
-      this.store.timer.seconds++;
+      const elapsedSeconds = Math.floor(
+        (Date.now() - this.timerStartTimestamp) / 1000
+      );
+
+      this.store.timer.seconds = this.timerStartSeconds + elapsedSeconds;
+
       const timeDisplay = document.getElementById('main-timer-display');
-      if (timeDisplay) timeDisplay.textContent = this.formatSeconds(this.store.timer.seconds);
+      if (timeDisplay) {
+        timeDisplay.textContent = this.formatSeconds(this.store.timer.seconds);
+      }
 
       const topDisplay = document.getElementById('topbar-timer-display');
-      if (topDisplay) topDisplay.textContent = this.formatSeconds(this.store.timer.seconds);
+      if (topDisplay) {
+        topDisplay.textContent = this.formatSeconds(this.store.timer.seconds);
+      }
     }, 1000);
 
     this.render();
   }
 
   pauseTimer() {
+    if (this.store.timer.isRunning && this.timerStartTimestamp) {
+      const elapsedSeconds = Math.floor(
+        (Date.now() - this.timerStartTimestamp) / 1000
+      );
+
+      this.store.timer.seconds = this.timerStartSeconds + elapsedSeconds;
+    }
+
     this.store.timer.isRunning = false;
+
     clearInterval(this.timerTicker);
+    this.timerTicker = null;
+
+    this.timerStartTimestamp = null;
+
     this.render();
   }
 
