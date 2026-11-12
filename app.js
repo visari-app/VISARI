@@ -2196,10 +2196,19 @@ class VisariApp {
     // 5. Promedio final combinado
     let finalAverage = Math.min(10.0, baseAverage + studyBonus);
 
-    // Mostrar promedio en pantalla
+    // Mostrar promedio general y bonus por tiempo de estudio
     const gpaElement = document.getElementById('dash-gpa');
+
     if (gpaElement) {
-      gpaElement.textContent = `${finalAverage.toFixed(1)} / 10`;
+      gpaElement.innerHTML = `
+    ${finalAverage.toFixed(1)} / 10
+    <span style="color: #16a34a; font-size: 0.65em; font-weight: 600; margin-left: 6px;">
+      +${studyBonus.toFixed(1)}
+    </span>
+    <span style="color: #16a34a; font-size: 0.45em; font-weight: 500; margin-left: 3px;">
+      Por tiempo de estudio
+    </span>
+  `;
     }
 
     this.renderDashboardSegments(state, metrics);
